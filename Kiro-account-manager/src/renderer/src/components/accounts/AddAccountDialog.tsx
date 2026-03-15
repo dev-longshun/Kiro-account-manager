@@ -1,9 +1,10 @@
-import { useState, useEffect, useRef } from 'react'
+import { useState, useEffect, useRef, useCallback } from 'react'
 import { Button, Card, CardContent, CardHeader, CardTitle, Input, Label } from '../ui'
 import { useAccountsStore } from '@/store/accounts'
 import { useTranslation } from '@/hooks/useTranslation'
 import type { SubscriptionType } from '@/types/account'
 import { X, Loader2, Download, Copy, Check, ExternalLink, Info, EyeOff } from 'lucide-react'
+import type { SocialCredential } from './SocialCredentialsDialog'
 
 interface AddAccountDialogProps {
   isOpen: boolean
@@ -64,14 +65,30 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
 
   // 检查账户是否已存在（同userId 或 同邮箱+同provider 才算重复）
   const isAccountExists = (email: string, userId: string, provider?: string): boolean => {
-    return Array.from(accounts.values()).some(acc => {
+    console.log(`🔍 [DupCheck] === 开始重复检测 ===`)
+    console.log(`🔍 [DupCheck] 新账号: email="${email}", userId="${userId}", provider="${provider}"`)
+    console.log(`🔍 [DupCheck] 已有账号数量: ${accounts.size}`)
+
+    const result = Array.from(accounts.values()).some((acc, index) => {
+      console.log(`🔍 [DupCheck] 比较第${index}个已有账号: email="${acc.email}", userId="${acc.userId}", provider="${acc.credentials.provider}"`)
+
       // userId 相同则重复（主要判断依据）
-      if (userId && acc.userId === userId) return true
+      if (userId && acc.userId === userId) {
+        console.log(`🔍 [DupCheck] ❌ 命中规则1: userId 相同 ("${userId}" === "${acc.userId}")`)
+        return true
+      }
       // email 非空且相同，且 provider 相同则重复（允许同邮箱不同登录方式）
       // 企业账号可能没有 email，所以 email 为空时不用 email 判断
-      if (email && acc.email === email && acc.credentials.provider === provider) return true
+      if (email && acc.email === email && acc.credentials.provider === provider) {
+        console.log(`🔍 [DupCheck] ❌ 命中规则2: email+provider 相同 (email="${email}", provider="${provider}")`)
+        return true
+      }
+      console.log(`🔍 [DupCheck] ✅ 第${index}个账号不匹配`)
       return false
     })
+
+    console.log(`🔍 [DupCheck] === 检测结果: ${result ? '重复' : '不重复'} ===`)
+    return result
   }
 
   // 导入模式
@@ -108,6 +125,22 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
   const [loginType, setLoginType] = useState<LoginType>('builderid')
   const [isLoggingIn, setIsLoggingIn] = useState(false)
   const [usePrivateMode, setUsePrivateMode] = useState(loginPrivateMode) // 临时隐私模式开关，默认跟随全局设置
+
+  // Social 凭据选择
+  const [socialCredentials, setSocialCredentials] = useState<SocialCredential[]>([])
+  const [showCredentialPicker, setShowCredentialPicker] = useState(false)
+  const [pendingSocialProvider, setPendingSocialProvider] = useState<'Google' | 'Github' | null>(null)
+
+  // 加载 social 凭据
+  const loadSocialCredentials = useCallback(async () => {
+    const result = await window.api.loadSocialCredentials()
+    if (result.success) setSocialCredentials(result.credentials)
+  }, [])
+
+  useEffect(() => {
+    if (isOpen) loadSocialCredentials()
+  }, [isOpen, loadSocialCredentials])
+
   const [builderIdLoginData, setBuilderIdLoginData] = useState<{
     userCode: string
     verificationUri: string
@@ -199,13 +232,19 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
       if (result.success && result.data) {
         const { email, userId } = result.data
         const providerName = tokenData.provider || 'BuilderId'
-        
+
+        console.log(`🔍 [Login] handleLoginSuccess 收到验证结果:`)
+        console.log(`🔍 [Login]   email="${email}"`)
+        console.log(`🔍 [Login]   userId="${userId}"`)
+        console.log(`🔍 [Login]   providerName="${providerName}" (tokenData.provider="${tokenData.provider}")`)
+        console.log(`🔍 [Login]   refreshToken="${result.data.refreshToken?.substring(0, 20)}..."`)
+
         // 检查账户是否已存在
         if (isAccountExists(email, userId, providerName)) {
           setError(isEn ? 'This account already exists' : '该账号已存在，无需重复添加')
           return
         }
-        
+
         // 添加账号
         const now = Date.now()
         addAccount({
@@ -454,13 +493,15 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
   }
 
   // 启动 Social Auth 登录 (Google/GitHub)
-  const handleStartSocialLogin = async (socialProvider: 'Google' | 'Github') => {
+  const handleStartSocialLogin = async (socialProvider: 'Google' | 'Github', credentials?: { username: string; password: string; totpSecret?: string }) => {
     setIsLoggingIn(true)
     setError(null)
+    setShowCredentialPicker(false)
+    setPendingSocialProvider(null)
 
     try {
-      const result = await window.api.startSocialLogin(socialProvider, usePrivateMode)
-      
+      const result = await window.api.startSocialLogin(socialProvider, usePrivateMode, credentials)
+
       if (!result.success) {
         setError(result.error || '启动登录失败')
         setIsLoggingIn(false)
@@ -469,6 +510,19 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
     } catch (e) {
       setError(e instanceof Error ? e.message : '启动登录失败')
       setIsLoggingIn(false)
+    }
+  }
+
+  // 点击 Google/GitHub 按钮时，检查是否有凭据可选
+  const handleSocialButtonClick = (socialProvider: 'Google' | 'Github') => {
+    const providerType = socialProvider === 'Google' ? 'google' : 'github'
+    const available = socialCredentials.filter(c => c.type === providerType)
+    if (available.length > 0) {
+      setPendingSocialProvider(socialProvider)
+      setShowCredentialPicker(true)
+    } else {
+      setLoginType(socialProvider === 'Google' ? 'google' : 'github')
+      handleStartSocialLogin(socialProvider)
     }
   }
 
@@ -1113,7 +1167,7 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
                       className="group w-full h-14 flex items-center px-4 gap-4 bg-background hover:bg-muted border border-border rounded-xl transition-all duration-200 hover:shadow-md hover:border-primary/30"
                       onClick={() => {
                         setLoginType('google')
-                        handleStartSocialLogin('Google')
+                        handleSocialButtonClick('Google')
                       }}
                     >
                       <div className="w-8 h-8 flex items-center justify-center bg-white dark:bg-slate-800 rounded-full shadow-sm border dark:border-slate-600 p-1.5 group-hover:scale-110 transition-transform">
@@ -1135,7 +1189,7 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
                       className="group w-full h-14 flex items-center px-4 gap-4 bg-background hover:bg-muted border border-border rounded-xl transition-all duration-200 hover:shadow-md hover:border-primary/30"
                       onClick={() => {
                         setLoginType('github')
-                        handleStartSocialLogin('Github')
+                        handleSocialButtonClick('Github')
                       }}
                     >
                       <div className="w-8 h-8 flex items-center justify-center bg-white dark:bg-slate-800 rounded-full shadow-sm border dark:border-slate-600 p-1.5 group-hover:scale-110 transition-transform">
@@ -1766,6 +1820,62 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
           )}
         </CardContent>
       </Card>
+
+      {/* 凭据选择弹出层 */}
+      {showCredentialPicker && pendingSocialProvider && (
+        <div className="fixed inset-0 z-[60] flex items-center justify-center">
+          <div className="absolute inset-0 bg-black/40" onClick={() => { setShowCredentialPicker(false); setPendingSocialProvider(null) }} />
+          <div className="relative bg-background rounded-lg shadow-xl w-[400px] max-h-[60vh] flex flex-col border">
+            <div className="flex items-center justify-between px-5 py-3 border-b">
+              <h3 className="text-sm font-semibold">
+                {isEn ? `Select ${pendingSocialProvider} credential` : `选择 ${pendingSocialProvider} 凭据`}
+              </h3>
+              <Button variant="ghost" size="icon" className="h-7 w-7" onClick={() => { setShowCredentialPicker(false); setPendingSocialProvider(null) }}>
+                <X className="h-3.5 w-3.5" />
+              </Button>
+            </div>
+            <div className="flex-1 overflow-y-auto p-3 space-y-1.5">
+              {socialCredentials
+                .filter(c => c.type === (pendingSocialProvider === 'Google' ? 'google' : 'github'))
+                .map(cred => (
+                  <button
+                    key={cred.id}
+                    className="w-full flex items-center gap-3 px-3 py-2.5 rounded-md border hover:bg-muted/50 hover:border-primary/30 transition-colors text-left"
+                    onClick={() => {
+                      setLoginType(pendingSocialProvider === 'Google' ? 'google' : 'github')
+                      handleStartSocialLogin(pendingSocialProvider, {
+                        username: cred.username,
+                        password: cred.password,
+                        totpSecret: cred.totpSecret
+                      })
+                    }}
+                  >
+                    <div className="flex-1 min-w-0">
+                      <div className="text-sm font-medium truncate">{cred.name || cred.username}</div>
+                      <div className="text-xs text-muted-foreground truncate">{cred.username}</div>
+                    </div>
+                    {cred.totpSecret && <span className="text-[10px] px-1.5 py-0.5 rounded bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-400">2FA</span>}
+                  </button>
+                ))}
+            </div>
+            <div className="px-5 py-3 border-t">
+              <Button
+                variant="outline"
+                size="sm"
+                className="w-full"
+                onClick={() => {
+                  setLoginType(pendingSocialProvider === 'Google' ? 'google' : 'github')
+                  setShowCredentialPicker(false)
+                  setPendingSocialProvider(null)
+                  handleStartSocialLogin(pendingSocialProvider!)
+                }}
+              >
+                {isEn ? 'Login manually (no auto-fill)' : '手动登录（不自动填充）'}
+              </Button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   )
 }

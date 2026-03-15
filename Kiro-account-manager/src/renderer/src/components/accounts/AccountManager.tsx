@@ -8,6 +8,7 @@ import { EditAccountDialog } from './EditAccountDialog'
 import { GroupManageDialog } from './GroupManageDialog'
 import { TagManageDialog } from './TagManageDialog'
 import { ExportDialog } from './ExportDialog'
+import { SocialCredentialsDialog } from './SocialCredentialsDialog'
 import { Button } from '../ui'
 import type { Account } from '@/types/account'
 import { ArrowLeft, Loader2, Users } from 'lucide-react'
@@ -30,6 +31,7 @@ export function AccountManager({ onBack }: AccountManagerProps): React.ReactNode
   const [showGroupDialog, setShowGroupDialog] = useState(false)
   const [showTagDialog, setShowTagDialog] = useState(false)
   const [showExportDialog, setShowExportDialog] = useState(false)
+  const [showCredentialsDialog, setShowCredentialsDialog] = useState(false)
   const [isFilterExpanded, setIsFilterExpanded] = useState(false)
   const { t } = useTranslation()
   const isEn = t('common.unknown') === 'Unknown'
@@ -205,6 +207,7 @@ export function AccountManager({ onBack }: AccountManagerProps): React.ReactNode
           onExport={handleExport}
           onManageGroups={handleManageGroups}
           onManageTags={handleManageTags}
+          onManageCredentials={() => setShowCredentialsDialog(true)}
           isFilterExpanded={isFilterExpanded}
           onToggleFilter={() => setIsFilterExpanded(!isFilterExpanded)}
         />
@@ -252,6 +255,12 @@ export function AccountManager({ onBack }: AccountManagerProps): React.ReactNode
         onClose={() => setShowExportDialog(false)}
         accounts={getExportAccounts()}
         selectedCount={selectedIds.size}
+      />
+
+      {/* Social 凭据管理对话框 */}
+      <SocialCredentialsDialog
+        isOpen={showCredentialsDialog}
+        onClose={() => setShowCredentialsDialog(false)}
       />
     </div>
   )

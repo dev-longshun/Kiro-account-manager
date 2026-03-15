@@ -1,4 +1,4 @@
-import { app, shell, BrowserWindow, ipcMain, dialog, globalShortcut } from 'electron'
+import { app, shell, BrowserWindow, ipcMain, dialog, globalShortcut, session } from 'electron'
 import { autoUpdater } from 'electron-updater'
 import * as machineIdModule from './machineId'
 import { join } from 'path'
@@ -8,6 +8,7 @@ import { encode, decode } from 'cbor-x'
 import { ProxyAgent, fetch as undiciFetch, type RequestInit as UndiciRequestInit } from 'undici'
 import icon from '../../resources/icon.png?asset'
 import { ProxyServer, type ProxyAccount, type ProxyConfig } from './proxy'
+import { startAutoFill, type OAuthCredentials } from './oauth-autofill'
 import { 
   initKProxyService, 
   getKProxyService, 
@@ -142,18 +143,26 @@ export function getUseKProxyForApi(): boolean {
 
 // 获取 K-Proxy 代理 agent（如果启用）
 function getKProxyAgent(): ProxyAgent | undefined {
-  if (!useKProxyForApi) return undefined
-  const kproxyService = getKProxyService()
-  if (!kproxyService || !kproxyService.isRunning()) return undefined
-  const config = kproxyService.getConfig()
-  const proxyUrl = `http://${config.host}:${config.port}`
-  // 配置代理 agent，允许自签名证书（K-Proxy 使用自签名 CA）
-  return new ProxyAgent({
-    uri: proxyUrl,
-    requestTls: {
-      rejectUnauthorized: false // 允许自签名证书
+  // 优先使用 K-Proxy
+  if (useKProxyForApi) {
+    const kproxyService = getKProxyService()
+    if (kproxyService && kproxyService.isRunning()) {
+      const config = kproxyService.getConfig()
+      const proxyUrl = `http://${config.host}:${config.port}`
+      return new ProxyAgent({
+        uri: proxyUrl,
+        requestTls: {
+          rejectUnauthorized: false
+        }
+      })
     }
-  })
+  }
+  // Fallback: 读取环境变量中的系统代理（梯子）
+  const envProxy = process.env.HTTPS_PROXY || process.env.https_proxy || process.env.HTTP_PROXY || process.env.http_proxy
+  if (envProxy) {
+    return new ProxyAgent({ uri: envProxy })
+  }
+  return undefined
 }
 
 // ============ OIDC Token 刷新 ============
@@ -430,13 +439,17 @@ function openBrowserInPrivateMode(url: string): void {
         }
       })
     } else if (platform === 'darwin') {
-      // macOS: 尝试 Chrome -> Firefox -> 默认浏览器
-      exec(`open -na "Google Chrome" --args --incognito "${url}"`, (err) => {
+      // macOS: 尝试 Brave -> Chrome -> Firefox -> 默认浏览器
+      exec(`open -na "Brave Browser" --args --incognito "${url}"`, (err) => {
         if (err) {
-          exec(`open -a Firefox --args -private-window "${url}"`, (err2) => {
+          exec(`open -na "Google Chrome" --args --incognito "${url}"`, (err2) => {
             if (err2) {
-              console.log('[Browser] Fallback to default browser')
-              shell.openExternal(url)
+              exec(`open -a Firefox --args -private-window "${url}"`, (err3) => {
+                if (err3) {
+                  console.log('[Browser] Fallback to default browser')
+                  shell.openExternal(url)
+                }
+              })
             }
           })
         }
@@ -520,14 +533,17 @@ async function refreshSocialToken(refreshToken: string): Promise<OidcRefreshResu
   const machineId = getCurrentMachineId()
   
   try {
-    const response = await fetch(url, {
+    const agent = getKProxyAgent()
+    const fetchOptions: UndiciRequestInit = {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         'User-Agent': getKiroUserAgent(machineId)
       },
       body: JSON.stringify({ refreshToken })
-    })
+    }
+    if (agent) fetchOptions.dispatcher = agent
+    const response = await undiciFetch(url, fetchOptions)
     
     if (!response.ok) {
       const errorText = await response.text()
@@ -3088,11 +3104,11 @@ app.whenReady().then(async () => {
       }
       
       const usageResult = await getUsageAndLimits(refreshResult.accessToken, idp, undefined, undefined, region) as UsageResponse
-      
+
       // 解析用户信息
       const email = usageResult.userInfo?.email || ''
       const userId = usageResult.userInfo?.userId || ''
-      
+
       // 解析订阅类型（注意检查顺序：先检查更具体的类型）
       const subscriptionTitle = usageResult.subscriptionInfo?.subscriptionTitle || 'Free'
       let subscriptionType = 'Free'
@@ -3910,8 +3926,8 @@ app.whenReady().then(async () => {
   })
 
   // IPC: 启动 Social Auth 登录 (Google/GitHub)
-  ipcMain.handle('start-social-login', async (_event, provider: 'Google' | 'Github', usePrivateMode?: boolean) => {
-    console.log(`[Login] Starting ${provider} Social Auth login... (privateMode: ${usePrivateMode})`)
+  ipcMain.handle('start-social-login', async (_event, provider: 'Google' | 'Github', usePrivateMode?: boolean, credentials?: OAuthCredentials) => {
+    console.log(`[Login] Starting ${provider} Social Auth login... (privateMode: ${usePrivateMode}, autoFill: ${!!credentials})`)
     
     const crypto = await import('crypto')
 
@@ -3928,6 +3944,7 @@ app.whenReady().then(async () => {
     loginUrl.searchParams.set('code_challenge', codeChallenge)
     loginUrl.searchParams.set('code_challenge_method', 'S256')
     loginUrl.searchParams.set('state', oauthState)
+    loginUrl.searchParams.set('prompt', 'login')
 
     // 保存登录状态
     currentLoginState = {
@@ -3941,11 +3958,75 @@ app.whenReady().then(async () => {
     const urlStr = loginUrl.toString()
     console.log(`[Login] Opening browser for ${provider} login...`)
 
-    // 根据是否使用隐私模式选择打开方式
-    if (usePrivateMode) {
-      openBrowserInPrivateMode(urlStr)
-    } else {
-      shell.openExternal(urlStr)
+    // 使用独立 session 的 BrowserWindow，每次 OAuth 都是干净的 cookie 环境
+    const partition = `oauth-${Date.now()}`
+    const oauthSession = session.fromPartition(partition)
+    const oauthWin = new BrowserWindow({
+      width: 900,
+      height: 700,
+      title: `Login with ${provider}`,
+      webPreferences: {
+        partition,
+        nodeIntegration: false,
+        contextIsolation: true,
+      },
+    })
+    oauthWin.setMenuBarVisibility(false)
+
+    // 拦截 kiro:// 协议重定向，提取 auth code
+    oauthWin.webContents.on('will-redirect', (_event, redirectUrl) => {
+      if (redirectUrl.startsWith('kiro://')) {
+        handleOAuthCallback(redirectUrl)
+        oauthWin.close()
+      }
+    })
+    oauthWin.webContents.on('will-navigate', (_event, navUrl) => {
+      if (navUrl.startsWith('kiro://')) {
+        _event.preventDefault()
+        handleOAuthCallback(navUrl)
+        oauthWin.close()
+      }
+    })
+    // 有些 OAuth 流程通过新窗口请求跳转
+    oauthWin.webContents.setWindowOpenHandler(({ url: openUrl }) => {
+      if (openUrl.startsWith('kiro://')) {
+        handleOAuthCallback(openUrl)
+        oauthWin.close()
+      }
+      return { action: 'deny' }
+    })
+
+    oauthWin.loadURL(urlStr)
+
+    // 如果提供了凭据，启动自动填充
+    if (credentials) {
+      startAutoFill(oauthWin.webContents, provider, credentials)
+    }
+
+    function handleOAuthCallback(url: string) {
+      try {
+        const cbUrl = new URL(url)
+        const code = cbUrl.searchParams.get('code')
+        const cbState = cbUrl.searchParams.get('state')
+        const error = cbUrl.searchParams.get('error')
+        if (error) {
+          console.log('[Login] Auth callback error:', error)
+          if (mainWindow) {
+            mainWindow.webContents.send('social-auth-callback', { error })
+            mainWindow.focus()
+          }
+          return
+        }
+        if (code && cbState && mainWindow) {
+          console.log('[Login] Auth callback received, code:', code.substring(0, 20) + '...')
+          mainWindow.webContents.send('social-auth-callback', { code, state: cbState })
+          mainWindow.focus()
+        }
+      } catch (e) {
+        console.error('[Login] Failed to parse OAuth callback URL:', e)
+      }
+      // 清理临时 session
+      oauthSession.clearStorageData().catch(() => {})
     }
 
     return {
@@ -3973,7 +4054,8 @@ app.whenReady().then(async () => {
     const redirectUri = 'kiro://kiro.kiroAgent/authenticate-success'
 
     try {
-      const tokenRes = await fetch(`${KIRO_AUTH_ENDPOINT}/oauth/token`, {
+      const agent = getKProxyAgent()
+      const fetchOptions: UndiciRequestInit = {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -3981,7 +4063,9 @@ app.whenReady().then(async () => {
           code_verifier: codeVerifier,
           redirect_uri: redirectUri
         })
-      })
+      }
+      if (agent) fetchOptions.dispatcher = agent
+      const tokenRes = await undiciFetch(`${KIRO_AUTH_ENDPOINT}/oauth/token`, fetchOptions)
 
       if (!tokenRes.ok) {
         const errText = await tokenRes.text()
@@ -5551,6 +5635,45 @@ if (!gotTheLock) {
 app.on('open-url', (_event, url) => {
   handleProtocolUrl(url)
 })
+
+
+  // IPC: Social 凭据管理 — 保存凭据列表
+  ipcMain.handle('save-social-credentials', async (_event, credentials: unknown[]) => {
+    try {
+      await initStore()
+      store!.set('socialCredentials', credentials)
+      return { success: true }
+    } catch (e) {
+      console.error('[Credentials] save error:', e)
+      return { success: false, error: String(e) }
+    }
+  })
+
+  // IPC: Social 凭据管理 — 读取凭据列表
+  ipcMain.handle('load-social-credentials', async () => {
+    try {
+      await initStore()
+      const data = store!.get('socialCredentials', [])
+      return { success: true, credentials: data }
+    } catch (e) {
+      console.error('[Credentials] load error:', e)
+      return { success: false, credentials: [], error: String(e) }
+    }
+  })
+
+  // IPC: Social 凭据管理 — 删除单个凭据
+  ipcMain.handle('delete-social-credential', async (_event, id: string) => {
+    try {
+      await initStore()
+      const list = (store!.get('socialCredentials', []) as Array<{ id: string }>)
+      const filtered = list.filter(c => c.id !== id)
+      store!.set('socialCredentials', filtered)
+      return { success: true }
+    } catch (e) {
+      console.error('[Credentials] delete error:', e)
+      return { success: false, error: String(e) }
+    }
+  })
 
 // Quit when all windows are closed, except on macOS. There, it's common
 // for applications and their menu bar to stay active until the user quits

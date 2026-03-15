@@ -21,7 +21,8 @@ import {
   ChevronDown,
   Check,
   X,
-  Minus
+  Minus,
+  KeyRound
 } from 'lucide-react'
 
 interface AccountToolbarProps {
@@ -30,6 +31,7 @@ interface AccountToolbarProps {
   onExport: () => void
   onManageGroups: () => void
   onManageTags: () => void
+  onManageCredentials: () => void
   isFilterExpanded: boolean
   onToggleFilter: () => void
 }
@@ -40,6 +42,7 @@ export function AccountToolbar({
   onExport,
   onManageGroups,
   onManageTags,
+  onManageCredentials,
   isFilterExpanded,
   onToggleFilter
 }: AccountToolbarProps): React.ReactNode {
@@ -215,6 +218,10 @@ export function AccountToolbar({
           <Button variant="outline" onClick={onExport}>
             <Download className="h-4 w-4 mr-1" />
             {isEn ? 'Export' : '导出'}
+          </Button>
+          <Button variant="outline" onClick={onManageCredentials}>
+            <KeyRound className="h-4 w-4 mr-1" />
+            {isEn ? 'Credentials' : '凭据'}
           </Button>
         </div>
       </div>

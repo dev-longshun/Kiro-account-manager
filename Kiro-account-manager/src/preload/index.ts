@@ -315,13 +315,13 @@ const api = {
   },
 
   // 启动 Social Auth 登录 (Google/GitHub)
-  startSocialLogin: (provider: 'Google' | 'Github', usePrivateMode?: boolean): Promise<{
+  startSocialLogin: (provider: 'Google' | 'Github', usePrivateMode?: boolean, credentials?: { username: string; password: string; totpSecret?: string }): Promise<{
     success: boolean
     loginUrl?: string
     state?: string
     error?: string
   }> => {
-    return ipcRenderer.invoke('start-social-login', provider, usePrivateMode)
+    return ipcRenderer.invoke('start-social-login', provider, usePrivateMode, credentials)
   },
 
   // 交换 Social Auth token
@@ -1021,6 +1021,23 @@ const api = {
   // 发送关闭确认对话框响应
   sendCloseConfirmResponse: (action: 'minimize' | 'quit' | 'cancel', rememberChoice: boolean): void => {
     ipcRenderer.send('close-confirm-response', action, rememberChoice)
+  },
+
+  // ============ Social 凭据管理 ============
+
+  // 保存 Social 凭据列表
+  saveSocialCredentials: (credentials: Array<{ id: string; type: string; name: string; username: string; password: string; totpSecret?: string; group?: string; recoveryEmail?: string }>): Promise<{ success: boolean; error?: string }> => {
+    return ipcRenderer.invoke('save-social-credentials', credentials)
+  },
+
+  // 读取 Social 凭据列表
+  loadSocialCredentials: (): Promise<{ success: boolean; credentials: Array<{ id: string; type: string; name: string; username: string; password: string; totpSecret?: string; group?: string; recoveryEmail?: string }>; error?: string }> => {
+    return ipcRenderer.invoke('load-social-credentials')
+  },
+
+  // 删除单个 Social 凭据
+  deleteSocialCredential: (id: string): Promise<{ success: boolean; error?: string }> => {
+    return ipcRenderer.invoke('delete-social-credential', id)
   }
 }
 
