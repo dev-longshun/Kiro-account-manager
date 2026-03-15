@@ -146,7 +146,8 @@ async function githubFill2FA(wc: WebContents, totpSecret: string): Promise<boole
   `)
   if (!has2FA) return false
 
-  await delay(1000)
+  // 等待 2FA 页面完全就绪，避免过早填值触发空值 verify
+  await delay(2000)
   const code = generateTOTP(totpSecret)
 
   await exec(wc, `
@@ -174,9 +175,27 @@ async function githubFill2FA(wc: WebContents, totpSecret: string): Promise<boole
 // ---------------------------------------------------------------------------
 
 async function googleFillEmail(wc: WebContents, email: string): Promise<boolean> {
-  const hasEmail = await exec(wc, `
-    !!document.querySelector('input[type="email"]') && !document.querySelector('input[type="password"]')
+  const debugInfo = await exec(wc, `
+    JSON.stringify({
+      url: location.href,
+      hasEmailInput: !!document.querySelector('input[type="email"]'),
+      hasPasswordInput: !!document.querySelector('input[type="password"]'),
+      allInputTypes: Array.from(document.querySelectorAll('input')).map(i => ({ type: i.type, name: i.name, id: i.id })).slice(0, 15),
+      bodyText: document.body?.innerText?.substring(0, 300) || ''
+    })
   `)
+  console.log('🔍 [autofill-debug] googleFillEmail check:', debugInfo)
+
+  const hasEmail = await exec(wc, `
+    (function() {
+      var emailInput = document.querySelector('input[type="email"]') || document.querySelector('#identifierId');
+      if (!emailInput) return false;
+      // 排除隐藏的 password 字段（Google v3 登录页在邮箱步骤有 hiddenPassword）
+      var visiblePwd = document.querySelector('input[type="password"]:not([name="hiddenPassword"])');
+      return !visiblePwd;
+    })()
+  `)
+  console.log('🔍 [autofill-debug] googleFillEmail hasEmail:', hasEmail)
   if (!hasEmail) return false
 
   await delay(800)
@@ -195,13 +214,32 @@ async function googleFillEmail(wc: WebContents, email: string): Promise<boolean>
 }
 
 async function googleFillPassword(wc: WebContents, password: string): Promise<boolean> {
-  const hasPwd = await exec(wc, `!!document.querySelector('input[type="password"]')`)
+  const debugInfo = await exec(wc, `
+    JSON.stringify({
+      url: location.href,
+      hasPasswordInput: !!document.querySelector('input[type="password"]'),
+      allInputTypes: Array.from(document.querySelectorAll('input')).map(i => ({ type: i.type, name: i.name, id: i.id })).slice(0, 15)
+    })
+  `)
+  console.log('🔍 [autofill-debug] googleFillPassword check:', debugInfo)
+
+  const hasPwd = await exec(wc, `
+    (function() {
+      // 排除 Google 邮箱步骤的 hiddenPassword
+      var pwd = document.querySelector('input[type="password"]:not([name="hiddenPassword"])');
+      if (!pwd) return false;
+      // 确认可见（offsetParent !== null 或 getComputedStyle 检查）
+      var style = window.getComputedStyle(pwd);
+      return style.display !== 'none' && style.visibility !== 'hidden' && pwd.offsetParent !== null;
+    })()
+  `)
+  console.log('🔍 [autofill-debug] googleFillPassword hasPwd:', hasPwd)
   if (!hasPwd) return false
 
   await delay(800)
   await exec(wc, `
     ${INJECT_SET_NATIVE_VALUE}
-    __setNativeValue(document.querySelector('input[type="password"]'), ${JSON.stringify(password)});
+    __setNativeValue(document.querySelector('input[type="password"]:not([name="hiddenPassword"])'), ${JSON.stringify(password)});
   `)
   await delay(500)
   await exec(wc, `
@@ -214,20 +252,42 @@ async function googleFillPassword(wc: WebContents, password: string): Promise<bo
 }
 
 async function googleFill2FA(wc: WebContents, totpSecret: string): Promise<boolean> {
+  const debugInfo = await exec(wc, `
+    JSON.stringify({
+      url: location.href,
+      hasTelPin: !!document.querySelector('input[type="tel"][name="Pin"]'),
+      hasTotpPin: !!document.querySelector('input[type="tel"]#totpPin'),
+      hasTotpName: !!document.querySelector('input[name="totpPin"]'),
+      hasTelAria: !!document.querySelector('input[type="tel"][aria-label]'),
+      hasPassword: !!document.querySelector('input[type="password"]'),
+      allInputTypes: Array.from(document.querySelectorAll('input')).map(i => ({ type: i.type, name: i.name, id: i.id })).slice(0, 15)
+    })
+  `)
+  console.log('🔍 [autofill-debug] googleFill2FA check:', debugInfo)
+
   const has2FA = await exec(wc, `
-    !!(document.querySelector('input[type="tel"]#totpPin')
-      || document.querySelector('input[name="totpPin"]')
-      || document.querySelector('input[type="tel"][aria-label]'))
-    && !document.querySelector('input[type="password"]')
+    (function() {
+      // v3: input[type="tel"][name="Pin"]
+      // v2: input[type="tel"]#totpPin / input[name="totpPin"] / input[type="tel"][aria-label]
+      var input = document.querySelector('input[type="tel"][name="Pin"]')
+        || document.querySelector('input[type="tel"]#totpPin')
+        || document.querySelector('input[name="totpPin"]')
+        || document.querySelector('input[type="tel"][aria-label]');
+      if (!input) return false;
+      var visiblePwd = document.querySelector('input[type="password"]:not([name="hiddenPassword"])');
+      return !visiblePwd;
+    })()
   `)
   if (!has2FA) return false
 
-  await delay(1000)
+  // 等待 2FA 页面完全就绪，避免过早填值触发空值 verify
+  await delay(2000)
   const code = generateTOTP(totpSecret)
 
   await exec(wc, `
     ${INJECT_SET_NATIVE_VALUE}
-    var input = document.querySelector('input[type="tel"]#totpPin')
+    var input = document.querySelector('input[type="tel"][name="Pin"]')
+      || document.querySelector('input[type="tel"]#totpPin')
       || document.querySelector('input[name="totpPin"]')
       || document.querySelector('input[type="tel"]');
     if (input) __setNativeValue(input, ${JSON.stringify(code)});
@@ -236,6 +296,7 @@ async function googleFill2FA(wc: WebContents, totpSecret: string): Promise<boole
   await exec(wc, `
     var btn = document.querySelector('#totpNext button')
       || document.querySelector('#totpNext')
+      || document.querySelector('button[jsname]')
       || document.querySelector('button[type="button"]');
     if (btn) btn.click();
   `)
@@ -270,6 +331,9 @@ export function startAutoFill(
 
   const handlePage = async (): Promise<void> => {
     if (destroyed) return
+
+    const currentUrl = await exec(webContents, 'location.href').catch(() => 'unknown')
+    log(`🔍 [autofill-debug] handlePage called | url=${currentUrl} | loginDone=${loginDone} | twofaDone=${twofaDone}`)
 
     try {
       if (provider === 'Github') {
@@ -337,12 +401,15 @@ export function startAutoFill(
   }
 
   // Listen for page transitions
-  webContents.on('did-navigate', () => {
-    // Small delay to let DOM settle
-    setTimeout(() => handlePage(), 600)
+  webContents.on('did-navigate', (_event, url) => {
+    log(`🔍 [autofill-debug] did-navigate: ${url}`)
+    // Longer delay for 2FA pages to fully render before attempting fill
+    setTimeout(() => handlePage(), 1200)
   })
   webContents.on('dom-ready', () => {
-    setTimeout(() => handlePage(), 600)
+    const url = webContents.getURL()
+    log(`🔍 [autofill-debug] dom-ready: ${url}`)
+    setTimeout(() => handlePage(), 1200)
   })
 }
 
