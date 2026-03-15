@@ -3,7 +3,7 @@ import { Button, Card, CardContent, CardHeader, CardTitle, Input, Label } from '
 import { useAccountsStore } from '@/store/accounts'
 import { useTranslation } from '@/hooks/useTranslation'
 import type { SubscriptionType } from '@/types/account'
-import { X, Loader2, Download, Copy, Check, ExternalLink, Info, EyeOff } from 'lucide-react'
+import { X, Loader2, Download, Copy, Check, ExternalLink, Info, EyeOff, CheckSquare, Square, CheckCircle2, XCircle } from 'lucide-react'
 import type { SocialCredential } from './SocialCredentialsDialog'
 
 interface AddAccountDialogProps {
@@ -131,6 +131,16 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
   const [showCredentialPicker, setShowCredentialPicker] = useState(false)
   const [pendingSocialProvider, setPendingSocialProvider] = useState<'Google' | 'Github' | null>(null)
 
+  // 批量导入模式
+  const [batchMode, setBatchMode] = useState(false)
+  const [batchSelectedIds, setBatchSelectedIds] = useState<Set<string>>(new Set())
+  const [isBatchRunning, setIsBatchRunning] = useState(false)
+  const [batchTotal, setBatchTotal] = useState(0)
+  const [batchDone, setBatchDone] = useState(0)
+  const [batchResults, setBatchResults] = useState<{username: string; success: boolean; error?: string}[]>([])
+  const batchQueueRef = useRef<SocialCredential[]>([])
+  const batchIndexRef = useRef(0)
+
   // 加载 social 凭据
   const loadSocialCredentials = useCallback(async () => {
     const result = await window.api.loadSocialCredentials()
@@ -174,30 +184,65 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
 
     const unsubscribe = window.api.onSocialAuthCallback(async (data) => {
       console.log('[AddAccountDialog] Social auth callback:', data)
-      
+
       if (data.error) {
-        setError(`登录失败: ${data.error}`)
-        setIsLoggingIn(false)
+        if (batchQueueRef.current.length > 0) {
+          const currentCred = batchQueueRef.current[batchIndexRef.current]
+          setBatchResults(prev => [...prev, { username: currentCred?.username || '?', success: false, error: data.error }])
+          setBatchDone(prev => prev + 1)
+          batchIndexRef.current++
+          if (batchIndexRef.current < batchQueueRef.current.length) {
+            setTimeout(() => startNextBatchLogin(), 1000)
+          } else {
+            setIsBatchRunning(false)
+            setIsLoggingIn(false)
+            batchQueueRef.current = []
+          }
+        } else {
+          setError(`登录失败: ${data.error}`)
+          setIsLoggingIn(false)
+        }
         return
       }
 
       if (data.code && data.state) {
+        let success = false
+        let errorMsg: string | undefined
+        const currentCred = batchQueueRef.current.length > 0 ? batchQueueRef.current[batchIndexRef.current] : null
+
         try {
           const result = await window.api.exchangeSocialToken(data.code, data.state)
           if (result.success) {
+            const isBatch = batchQueueRef.current.length > 0
             await handleLoginSuccess({
               accessToken: result.accessToken!,
               refreshToken: result.refreshToken!,
               authMethod: 'social',
               provider: result.provider
-            })
+            }, isBatch ? { skipCloseAndReset: true } : undefined)
+            success = true
           } else {
-            setError(result.error || 'Token 交换失败')
+            errorMsg = result.error || 'Token 交换失败'
+            if (!batchQueueRef.current.length) setError(errorMsg)
           }
         } catch (e) {
-          setError(e instanceof Error ? e.message : '登录失败')
+          errorMsg = e instanceof Error ? e.message : '登录失败'
+          if (!batchQueueRef.current.length) setError(errorMsg)
         } finally {
-          setIsLoggingIn(false)
+          if (batchQueueRef.current.length > 0) {
+            setBatchResults(prev => [...prev, { username: currentCred?.username || '?', success, error: errorMsg }])
+            setBatchDone(prev => prev + 1)
+            batchIndexRef.current++
+            if (batchIndexRef.current < batchQueueRef.current.length) {
+              setTimeout(() => startNextBatchLogin(), 1000)
+            } else {
+              setIsBatchRunning(false)
+              setIsLoggingIn(false)
+              batchQueueRef.current = []
+            }
+          } else {
+            setIsLoggingIn(false)
+          }
         }
       }
     })
@@ -215,7 +260,7 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
     startUrl?: string
     authMethod?: string
     provider?: string
-  }) => {
+  }, options?: { skipCloseAndReset?: boolean }) => {
     console.log('[AddAccountDialog] Login successful, verifying credentials...')
     
     try {
@@ -296,8 +341,10 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
           lastUsedAt: now
         })
 
-        resetForm()
-        onClose()
+        if (!options?.skipCloseAndReset) {
+          resetForm()
+          onClose()
+        }
       } else {
         setError(result.error || '验证失败')
       }
@@ -524,6 +571,53 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
       setLoginType(socialProvider === 'Google' ? 'google' : 'github')
       handleStartSocialLogin(socialProvider)
     }
+  }
+
+  // 批量导入：启动下一个登录
+  const startNextBatchLogin = () => {
+    const idx = batchIndexRef.current
+    const queue = batchQueueRef.current
+    if (idx >= queue.length) return
+
+    const cred = queue[idx]
+    const socialProvider = cred.type === 'google' ? 'Google' as const : 'Github' as const
+    setLoginType(socialProvider === 'Google' ? 'google' : 'github')
+    handleStartSocialLogin(socialProvider, {
+      username: cred.username,
+      password: cred.password,
+      totpSecret: cred.totpSecret
+    })
+  }
+
+  // 批量导入：开始
+  const startBatchImport = () => {
+    if (!pendingSocialProvider || batchSelectedIds.size === 0) return
+
+    const providerType = pendingSocialProvider === 'Google' ? 'google' : 'github'
+    const providerValue = pendingSocialProvider === 'Google' ? 'Google' : 'Github'
+
+    // 过滤掉已存在的账号
+    const queue = socialCredentials
+      .filter(c => c.type === providerType && batchSelectedIds.has(c.id))
+      .filter(c => !Array.from(accounts.values()).some(
+        acc => acc.email === c.username && acc.credentials.provider === providerValue
+      ))
+
+    if (queue.length === 0) {
+      setError('所选凭据均已导入，无需重复操作')
+      return
+    }
+
+    batchQueueRef.current = queue
+    batchIndexRef.current = 0
+    setBatchTotal(queue.length)
+    setBatchDone(0)
+    setBatchResults([])
+    setIsBatchRunning(true)
+    setShowCredentialPicker(false)
+    setError(null)
+
+    startNextBatchLogin()
   }
 
   // 复制 user_code
@@ -988,19 +1082,28 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
       clearInterval(pollIntervalRef.current)
       pollIntervalRef.current = null
     }
+    // 清理批量导入状态
+    setBatchMode(false)
+    setBatchSelectedIds(new Set())
+    setIsBatchRunning(false)
+    setBatchTotal(0)
+    setBatchDone(0)
+    setBatchResults([])
+    batchQueueRef.current = []
+    batchIndexRef.current = 0
   }
 
   if (!isOpen) return null
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center">
-      <div className="absolute inset-0 bg-black/50" onClick={onClose} />
+      <div className="absolute inset-0 bg-black/50" onClick={isBatchRunning ? undefined : onClose} />
 
       <Card className="relative w-full max-w-lg max-h-[90vh] overflow-auto z-10">
         <CardHeader className="pb-4 border-b">
           <div className="flex flex-row items-center justify-between">
             <CardTitle className="text-xl font-bold">{isEn ? 'Add Account' : '添加账号'}</CardTitle>
-            <Button variant="ghost" size="icon" className="h-8 w-8 rounded-full hover:bg-muted" onClick={onClose}>
+            <Button variant="ghost" size="icon" className="h-8 w-8 rounded-full hover:bg-muted" onClick={onClose} disabled={isBatchRunning}>
               <X className="h-4 w-4" />
             </Button>
           </div>
@@ -1017,18 +1120,18 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
                   : 'text-muted-foreground hover:text-foreground hover:bg-background/50'
               }`}
               onClick={() => { setImportMode('login'); setError(null) }}
-              disabled={!!verifiedData || isLoggingIn}
+              disabled={!!verifiedData || isLoggingIn || isBatchRunning}
             >
               {isEn ? 'Login' : '在线登录'}
             </button>
             <button
               className={`py-2 px-3 text-sm rounded-lg transition-all duration-200 font-medium ${
-                importMode === 'oidc' 
-                  ? 'bg-background text-foreground shadow-sm ring-1 ring-black/5' 
+                importMode === 'oidc'
+                  ? 'bg-background text-foreground shadow-sm ring-1 ring-black/5'
                   : 'text-muted-foreground hover:text-foreground hover:bg-background/50'
               }`}
               onClick={() => { setImportMode('oidc'); setError(null) }}
-              disabled={!!verifiedData || isLoggingIn}
+              disabled={!!verifiedData || isLoggingIn || isBatchRunning}
             >
               {isEn ? 'OIDC Token' : 'OIDC 凭证'}
             </button>
@@ -1039,14 +1142,62 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
                   : 'text-muted-foreground hover:text-foreground hover:bg-background/50'
               }`}
               onClick={() => { setImportMode('sso'); setError(null) }}
-              disabled={!!verifiedData || isLoggingIn}
+              disabled={!!verifiedData || isLoggingIn || isBatchRunning}
             >
               SSO Token
             </button>
           </div>
 
+          {/* 批量导入进度面板 */}
+          {importMode === 'login' && (isBatchRunning || batchResults.length > 0) && (
+            <div className="space-y-4">
+              <div className="p-4 bg-blue-50 dark:bg-blue-900/20 rounded-lg">
+                <div className="flex items-center justify-center gap-2 mb-3">
+                  {isBatchRunning ? (
+                    <>
+                      <Loader2 className="h-5 w-5 animate-spin text-blue-500" />
+                      <span className="text-sm font-medium text-blue-700 dark:text-blue-300">
+                        批量导入中 {batchDone}/{batchTotal}
+                      </span>
+                    </>
+                  ) : (
+                    <span className="text-sm font-medium text-blue-700 dark:text-blue-300">
+                      批量导入完成 {batchResults.filter(r => r.success).length}/{batchResults.length} 成功
+                    </span>
+                  )}
+                </div>
+                {/* Progress bar */}
+                <div className="w-full h-1.5 bg-blue-200 dark:bg-blue-800 rounded-full mb-3">
+                  <div
+                    className="h-full bg-blue-500 rounded-full transition-all duration-300"
+                    style={{ width: `${batchTotal > 0 ? (batchDone / batchTotal) * 100 : 0}%` }}
+                  />
+                </div>
+                {/* Results list */}
+                {batchResults.length > 0 && (
+                  <div className="space-y-1 max-h-[200px] overflow-y-auto">
+                    {batchResults.map((r, i) => (
+                      <div key={i} className="flex items-center gap-2 text-xs px-2 py-1 rounded bg-white/50 dark:bg-black/20">
+                        {r.success
+                          ? <CheckCircle2 className="h-3.5 w-3.5 text-green-500 shrink-0" />
+                          : <XCircle className="h-3.5 w-3.5 text-red-500 shrink-0" />}
+                        <span className="truncate font-mono">{r.username}</span>
+                        {r.error && <span className="text-red-500 truncate ml-auto">{r.error}</span>}
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+              {!isBatchRunning && batchResults.length > 0 && (
+                <Button className="w-full" onClick={() => { setBatchResults([]); setBatchTotal(0); setBatchDone(0) }}>
+                  完成
+                </Button>
+              )}
+            </div>
+          )}
+
           {/* 登录模式 */}
-          {importMode === 'login' && !verifiedData && (
+          {importMode === 'login' && !verifiedData && !isBatchRunning && batchResults.length === 0 && (
             <div className="space-y-4">
               {/* 登录中状态 - Builder ID */}
               {isLoggingIn && builderIdLoginData && (
@@ -1824,23 +1975,100 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
       {/* 凭据选择弹出层 */}
       {showCredentialPicker && pendingSocialProvider && (
         <div className="fixed inset-0 z-[60] flex items-center justify-center">
-          <div className="absolute inset-0 bg-black/40" onClick={() => { setShowCredentialPicker(false); setPendingSocialProvider(null) }} />
+          <div className="absolute inset-0 bg-black/40" onClick={() => { setShowCredentialPicker(false); setPendingSocialProvider(null); setBatchMode(false); setBatchSelectedIds(new Set()) }} />
           <div className="relative bg-background rounded-lg shadow-xl w-[400px] max-h-[60vh] flex flex-col border">
             <div className="flex items-center justify-between px-5 py-3 border-b">
               <h3 className="text-sm font-semibold">
-                {isEn ? `Select ${pendingSocialProvider} credential` : `选择 ${pendingSocialProvider} 凭据`}
+                {batchMode
+                  ? (isEn ? `Batch select ${pendingSocialProvider} credentials` : `批量选择 ${pendingSocialProvider} 凭据`)
+                  : (isEn ? `Select ${pendingSocialProvider} credential` : `选择 ${pendingSocialProvider} 凭据`)}
               </h3>
-              <Button variant="ghost" size="icon" className="h-7 w-7" onClick={() => { setShowCredentialPicker(false); setPendingSocialProvider(null) }}>
-                <X className="h-3.5 w-3.5" />
-              </Button>
+              <div className="flex items-center gap-1">
+                <Button
+                  variant={batchMode ? 'default' : 'outline'}
+                  size="sm"
+                  className="h-6 text-xs px-2"
+                  onClick={() => { setBatchMode(!batchMode); setBatchSelectedIds(new Set()) }}
+                >
+                  {batchMode ? (isEn ? 'Single' : '单选') : (isEn ? 'Batch' : '批量')}
+                </Button>
+                <Button variant="ghost" size="icon" className="h-7 w-7" onClick={() => { setShowCredentialPicker(false); setPendingSocialProvider(null); setBatchMode(false); setBatchSelectedIds(new Set()) }}>
+                  <X className="h-3.5 w-3.5" />
+                </Button>
+              </div>
             </div>
             <div className="flex-1 overflow-y-auto p-3 space-y-1.5">
+              {batchMode && (() => {
+                const providerType = pendingSocialProvider === 'Google' ? 'google' : 'github'
+                const providerValue = pendingSocialProvider === 'Google' ? 'Google' : 'Github'
+                const available = socialCredentials.filter(c => c.type === providerType && !Array.from(accounts.values()).some(acc => acc.email === c.username && acc.credentials.provider === providerValue))
+                const allSelected = available.length > 0 && available.every(c => batchSelectedIds.has(c.id))
+                return (
+                  <button
+                    className="w-full flex items-center gap-3 px-3 py-2 rounded-md text-left text-sm text-muted-foreground hover:text-foreground transition-colors"
+                    onClick={() => {
+                      if (allSelected) {
+                        setBatchSelectedIds(new Set())
+                      } else {
+                        setBatchSelectedIds(new Set(available.map(c => c.id)))
+                      }
+                    }}
+                  >
+                    <span className="shrink-0">
+                      {allSelected ? <CheckSquare className="h-4 w-4 text-primary" /> : <Square className="h-4 w-4" />}
+                    </span>
+                    <span className="text-xs">{allSelected ? (isEn ? 'Deselect all' : '取消全选') : (isEn ? `Select all (${available.length})` : `全选 (${available.length})`)}</span>
+                  </button>
+                )
+              })()}
               {socialCredentials
                 .filter(c => c.type === (pendingSocialProvider === 'Google' ? 'google' : 'github'))
-                .map(cred => (
+                .map(cred => {
+                  const providerValue = pendingSocialProvider === 'Google' ? 'Google' : 'Github'
+                  const exists = Array.from(accounts.values()).some(
+                    acc => acc.email === cred.username && acc.credentials.provider === providerValue
+                  )
+                  if (batchMode) {
+                    return (
+                      <button
+                        key={cred.id}
+                        className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-md border transition-colors text-left ${
+                          exists
+                            ? 'border-muted bg-muted/20 opacity-50 cursor-not-allowed'
+                            : batchSelectedIds.has(cred.id)
+                              ? 'border-primary/50 bg-primary/5'
+                              : 'hover:bg-muted/50 hover:border-primary/30'
+                        }`}
+                        onClick={() => {
+                          if (exists) return
+                          setBatchSelectedIds(prev => {
+                            const next = new Set(prev)
+                            if (next.has(cred.id)) next.delete(cred.id); else next.add(cred.id)
+                            return next
+                          })
+                        }}
+                        disabled={exists}
+                      >
+                        <span className="shrink-0 text-muted-foreground">
+                          {batchSelectedIds.has(cred.id) ? <CheckSquare className="h-4 w-4 text-primary" /> : <Square className="h-4 w-4" />}
+                        </span>
+                        <div className="flex-1 min-w-0">
+                          <div className="text-sm font-medium truncate">{cred.name || cred.username}</div>
+                          <div className="text-xs text-muted-foreground truncate">{cred.username}</div>
+                        </div>
+                        {exists && <span className="text-[10px] px-1.5 py-0.5 rounded bg-orange-100 text-orange-600 dark:bg-orange-900/30 dark:text-orange-400 shrink-0">{isEn ? 'Exists' : '已存在'}</span>}
+                        {cred.totpSecret && <span className="text-[10px] px-1.5 py-0.5 rounded bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-400 shrink-0">2FA</span>}
+                      </button>
+                    )
+                  }
+                  return (
                   <button
                     key={cred.id}
-                    className="w-full flex items-center gap-3 px-3 py-2.5 rounded-md border hover:bg-muted/50 hover:border-primary/30 transition-colors text-left"
+                    className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-md border transition-colors text-left ${
+                      exists
+                        ? 'border-muted bg-muted/20 hover:bg-muted/30'
+                        : 'hover:bg-muted/50 hover:border-primary/30'
+                    }`}
                     onClick={() => {
                       setLoginType(pendingSocialProvider === 'Google' ? 'google' : 'github')
                       handleStartSocialLogin(pendingSocialProvider, {
@@ -1854,24 +2082,37 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
                       <div className="text-sm font-medium truncate">{cred.name || cred.username}</div>
                       <div className="text-xs text-muted-foreground truncate">{cred.username}</div>
                     </div>
-                    {cred.totpSecret && <span className="text-[10px] px-1.5 py-0.5 rounded bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-400">2FA</span>}
+                    {exists && <span className="text-[10px] px-1.5 py-0.5 rounded bg-orange-100 text-orange-600 dark:bg-orange-900/30 dark:text-orange-400 shrink-0">{isEn ? 'Exists' : '已存在'}</span>}
+                    {cred.totpSecret && <span className="text-[10px] px-1.5 py-0.5 rounded bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-400 shrink-0">2FA</span>}
                   </button>
-                ))}
+                  )
+                })}
             </div>
-            <div className="px-5 py-3 border-t">
-              <Button
-                variant="outline"
-                size="sm"
-                className="w-full"
-                onClick={() => {
-                  setLoginType(pendingSocialProvider === 'Google' ? 'google' : 'github')
-                  setShowCredentialPicker(false)
-                  setPendingSocialProvider(null)
-                  handleStartSocialLogin(pendingSocialProvider!)
-                }}
-              >
-                {isEn ? 'Login manually (no auto-fill)' : '手动登录（不自动填充）'}
-              </Button>
+            <div className="px-5 py-3 border-t space-y-2">
+              {batchMode ? (
+                <Button
+                  size="sm"
+                  className="w-full"
+                  disabled={batchSelectedIds.size === 0}
+                  onClick={startBatchImport}
+                >
+                  {isEn ? `Batch import (${batchSelectedIds.size})` : `一键导入 (${batchSelectedIds.size})`}
+                </Button>
+              ) : (
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="w-full"
+                  onClick={() => {
+                    setLoginType(pendingSocialProvider === 'Google' ? 'google' : 'github')
+                    setShowCredentialPicker(false)
+                    setPendingSocialProvider(null)
+                    handleStartSocialLogin(pendingSocialProvider!)
+                  }}
+                >
+                  {isEn ? 'Login manually (no auto-fill)' : '手动登录（不自动填充）'}
+                </Button>
+              )}
             </div>
           </div>
         </div>

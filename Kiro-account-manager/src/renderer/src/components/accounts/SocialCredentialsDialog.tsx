@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback } from 'react'
 import { Button } from '../ui'
-import { X, Upload, Download, Trash2, KeyRound, Github, Eye, EyeOff } from 'lucide-react'
+import { useAccountsStore } from '@/store/accounts'
+import { X, Upload, Download, Trash2, KeyRound, Github, Eye, EyeOff, CheckSquare, Square, MinusSquare } from 'lucide-react'
 
 // ---------------------------------------------------------------------------
 // Types
@@ -63,6 +64,7 @@ function generateId(): string {
 // ---------------------------------------------------------------------------
 
 export function SocialCredentialsDialog({ isOpen, onClose }: SocialCredentialsDialogProps): React.ReactNode {
+  const { accounts } = useAccountsStore()
   const [credentials, setCredentials] = useState<SocialCredential[]>([])
   const [inputText, setInputText] = useState('')
   const [preview, setPreview] = useState<Omit<SocialCredential, 'id'>[]>([])
@@ -70,6 +72,7 @@ export function SocialCredentialsDialog({ isOpen, onClose }: SocialCredentialsDi
   const [filter, setFilter] = useState<'all' | 'github' | 'google'>('all')
   const [showPasswords, setShowPasswords] = useState(false)
   const [message, setMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null)
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set())
 
   // Load credentials on open
   const loadCredentials = useCallback(async () => {
@@ -122,10 +125,67 @@ export function SocialCredentialsDialog({ isOpen, onClose }: SocialCredentialsDi
   // Delete single
   const handleDelete = async (id: string) => {
     const result = await window.api.deleteSocialCredential(id)
-    if (result.success) setCredentials(prev => prev.filter(c => c.id !== id))
+    if (result.success) {
+      setCredentials(prev => prev.filter(c => c.id !== id))
+      setSelectedIds(prev => { const next = new Set(prev); next.delete(id); return next })
+    }
+  }
+
+  // Batch delete
+  const handleBatchDelete = async () => {
+    if (selectedIds.size === 0) return
+    const remaining = credentials.filter(c => !selectedIds.has(c.id))
+    const result = await window.api.saveSocialCredentials(remaining)
+    if (result.success) {
+      setCredentials(remaining)
+      setSelectedIds(new Set())
+      showMsg('success', `已删除 ${selectedIds.size} 个凭据`)
+    } else {
+      showMsg('error', result.error || '批量删除失败')
+    }
+  }
+
+  // Check if credential already imported as account
+  const isCredentialImported = (cred: SocialCredential): boolean => {
+    const providerValue = cred.type === 'google' ? 'Google' : 'Github'
+    return Array.from(accounts.values()).some(
+      acc => acc.email === cred.username && acc.credentials.provider === providerValue
+    )
   }
 
   const filtered = filter === 'all' ? credentials : credentials.filter(c => c.type === filter)
+
+  // Clear selection on filter change
+  const handleFilterChange = (value: 'all' | 'github' | 'google') => {
+    setFilter(value)
+    setSelectedIds(new Set())
+  }
+
+  // Select all / deselect all (within current filter)
+  const allFilteredSelected = filtered.length > 0 && filtered.every(c => selectedIds.has(c.id))
+  const someFilteredSelected = filtered.some(c => selectedIds.has(c.id))
+  const toggleSelectAll = () => {
+    if (allFilteredSelected) {
+      setSelectedIds(prev => {
+        const next = new Set(prev)
+        filtered.forEach(c => next.delete(c.id))
+        return next
+      })
+    } else {
+      setSelectedIds(prev => {
+        const next = new Set(prev)
+        filtered.forEach(c => next.add(c.id))
+        return next
+      })
+    }
+  }
+  const toggleSelect = (id: string) => {
+    setSelectedIds(prev => {
+      const next = new Set(prev)
+      if (next.has(id)) next.delete(id); else next.add(id)
+      return next
+    })
+  }
 
   if (!isOpen) return null
 
@@ -197,13 +257,25 @@ export function SocialCredentialsDialog({ isOpen, onClose }: SocialCredentialsDi
           {/* Existing credentials */}
           <div className="space-y-3">
             <div className="flex items-center justify-between">
-              <h3 className="text-sm font-medium">已保存凭据 ({credentials.length})</h3>
+              <div className="flex items-center gap-2">
+                {filtered.length > 0 && (
+                  <button onClick={toggleSelectAll} className="text-muted-foreground hover:text-foreground transition-colors" title={allFilteredSelected ? '取消全选' : '全选'}>
+                    {allFilteredSelected ? <CheckSquare className="h-4 w-4" /> : someFilteredSelected ? <MinusSquare className="h-4 w-4" /> : <Square className="h-4 w-4" />}
+                  </button>
+                )}
+                <h3 className="text-sm font-medium">已保存凭据 ({credentials.length})</h3>
+                {selectedIds.size > 0 && (
+                  <Button variant="destructive" size="sm" className="h-6 text-xs px-2" onClick={handleBatchDelete}>
+                    <Trash2 className="h-3 w-3 mr-1" />删除 ({selectedIds.size})
+                  </Button>
+                )}
+              </div>
               <div className="flex items-center gap-2">
                 {/* Filter */}
                 <select
                   className="text-xs border rounded px-2 py-1 bg-background"
                   value={filter}
-                  onChange={e => setFilter(e.target.value as 'all' | 'github' | 'google')}
+                  onChange={e => handleFilterChange(e.target.value as 'all' | 'github' | 'google')}
                 >
                   <option value="all">全部</option>
                   <option value="github">GitHub</option>
@@ -223,13 +295,19 @@ export function SocialCredentialsDialog({ isOpen, onClose }: SocialCredentialsDi
               </div>
             ) : (
               <div className="space-y-1.5 max-h-[280px] overflow-y-auto">
-                {filtered.map((cred, i) => (
+                {filtered.map((cred, i) => {
+                  const imported = isCredentialImported(cred)
+                  return (
                   <div key={cred.id} className="flex items-center gap-3 px-3 py-2 rounded-md border bg-muted/20 hover:bg-muted/40 text-sm group">
+                    <button onClick={() => toggleSelect(cred.id)} className="text-muted-foreground hover:text-foreground shrink-0">
+                      {selectedIds.has(cred.id) ? <CheckSquare className="h-3.5 w-3.5" /> : <Square className="h-3.5 w-3.5" />}
+                    </button>
                     <span className="text-muted-foreground w-5 text-right text-xs">{i + 1}</span>
                     <span className={`inline-block px-1.5 py-0.5 rounded text-[10px] font-medium shrink-0 ${cred.type === 'google' ? 'bg-yellow-100 text-yellow-700 dark:bg-yellow-900/30 dark:text-yellow-400' : 'bg-blue-100 text-blue-700 dark:bg-blue-900/30 dark:text-blue-400'}`}>
                       {cred.type === 'google' ? 'Google' : <span className="flex items-center gap-0.5"><Github className="h-2.5 w-2.5" />GitHub</span>}
                     </span>
                     <span className="truncate flex-1 font-mono">{cred.username}</span>
+                    {imported && <span className="text-[10px] px-1.5 py-0.5 rounded bg-orange-100 text-orange-600 dark:bg-orange-900/30 dark:text-orange-400 shrink-0">已存在</span>}
                     <span className="text-muted-foreground text-xs w-20 truncate">{showPasswords ? cred.password : '••••••'}</span>
                     <span className="text-muted-foreground text-xs w-8 text-center">{cred.totpSecret ? '2FA' : '-'}</span>
                     {cred.group && <span className="text-muted-foreground text-xs">{cred.group}</span>}
@@ -237,7 +315,8 @@ export function SocialCredentialsDialog({ isOpen, onClose }: SocialCredentialsDi
                       <Trash2 className="h-3 w-3 text-destructive" />
                     </Button>
                   </div>
-                ))}
+                  )
+                })}
               </div>
             )}
           </div>
