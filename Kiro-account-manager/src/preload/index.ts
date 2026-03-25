@@ -269,13 +269,13 @@ const api = {
   },
 
   // 启动 IAM Identity Center SSO 登录 (Authorization Code flow)
-  startIamSsoLogin: (startUrl: string, region?: string): Promise<{
+  startIamSsoLogin: (startUrl: string, region?: string, credentials?: { username: string; password: string; totpSecret?: string }): Promise<{
     success: boolean
     authorizeUrl?: string
     expiresIn?: number
     error?: string
   }> => {
-    return ipcRenderer.invoke('start-iam-sso-login', startUrl, region || 'us-east-1')
+    return ipcRenderer.invoke('start-iam-sso-login', startUrl, region || 'us-east-1', credentials)
   },
 
   // 轮询 IAM SSO 授权状态

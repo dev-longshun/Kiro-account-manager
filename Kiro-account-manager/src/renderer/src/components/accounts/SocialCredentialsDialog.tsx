@@ -9,13 +9,15 @@ import { X, Upload, Download, Trash2, KeyRound, Github, Eye, EyeOff, CheckSquare
 
 export interface SocialCredential {
   id: string
-  type: 'github' | 'google'
+  type: 'github' | 'google' | 'enterprise'
   name: string
   username: string
   password: string
   totpSecret?: string
   group?: string
   recoveryEmail?: string
+  startUrl?: string
+  region?: string
 }
 
 interface SocialCredentialsDialogProps {
@@ -39,6 +41,7 @@ function parseInput(text: string): Omit<SocialCredential, 'id'>[] {
     } catch { /* fall through */ }
   }
 
+  // ---- 分隔格式（严格模式）
   const lines = text.split('\n').map(l => l.trim()).filter(Boolean)
   const accounts: Omit<SocialCredential, 'id'>[] = []
 
@@ -50,8 +53,72 @@ function parseInput(text: string): Omit<SocialCredential, 'id'>[] {
     } else if (parts.length === 5) {
       // Google: number----email----password----recoveryEmail----totpSecret
       accounts.push({ type: 'google', name: parts[1].split('@')[0], group: parts[0], username: parts[1], password: parts[2], recoveryEmail: parts[3], totpSecret: parts[4] })
+    } else if (parts.length === 6) {
+      // Enterprise: startUrl----region----name----username----password----totpSecret
+      accounts.push({ type: 'enterprise', name: parts[2], username: parts[3], password: parts[4], totpSecret: parts[5] || undefined, startUrl: parts[0], region: parts[1] })
     }
   }
+
+  // 如果严格模式没识别到，尝试自然语言智能解析（Enterprise SSO 凭据）
+  if (accounts.length === 0) {
+    const nlAccounts = parseNaturalLanguage(text)
+    if (nlAccounts.length > 0) return nlAccounts
+  }
+
+  return accounts
+}
+
+/**
+ * 自然语言智能解析：从粘贴的原始文本中提取 Enterprise SSO 凭据
+ *
+ * 支持格式示例：
+ *   Your AWS access portal URL:
+ *   https://d-906607ab48.awsapps.com/start
+ *   User：xxx@hotmail.com
+ *   Password：aws196S.
+ *   MFA：JLXZZ7EL362LJO6EZWWVS36RIWKRDASA
+ *
+ * 多个账号之间可以有空行、数字标识符、无关文本等
+ */
+function parseNaturalLanguage(text: string): Omit<SocialCredential, 'id'>[] {
+  const accounts: Omit<SocialCredential, 'id'>[] = []
+
+  // 按 SSO URL 锚点切分成多个块
+  // 匹配 https://...awsapps.com/start 或类似的 SSO portal URL
+  const urlPattern = /https?:\/\/[^\s]+\.awsapps\.com\/start\S*/gi
+  const urlMatches = [...text.matchAll(urlPattern)]
+
+  if (urlMatches.length === 0) return accounts
+
+  // 为每个 URL 切出一个文本块（从当前 URL 到下一个 URL 之前）
+  for (let i = 0; i < urlMatches.length; i++) {
+    const blockStart = urlMatches[i].index!
+    const blockEnd = i + 1 < urlMatches.length ? urlMatches[i + 1].index! : text.length
+    const block = text.slice(blockStart, blockEnd)
+    const startUrl = urlMatches[i][0].replace(/[，,、；;]+$/, '') // 去掉末尾中英文标点
+
+    // 提取字段（支持中英文冒号，忽略前后空白）
+    const userMatch = block.match(/User\s*[：:]\s*(\S+)/i)
+    const passwordMatch = block.match(/Password\s*[：:]\s*(\S+)/i)
+    const mfaMatch = block.match(/MFA\s*[：:]\s*([A-Z2-7=]+)/i)
+
+    if (userMatch && passwordMatch) {
+      const username = userMatch[1]
+      const password = passwordMatch[1]
+      const totpSecret = mfaMatch ? mfaMatch[1] : undefined
+
+      accounts.push({
+        type: 'enterprise',
+        name: username.split('@')[0],
+        username,
+        password,
+        totpSecret,
+        startUrl,
+        region: 'us-east-1',
+      })
+    }
+  }
+
   return accounts
 }
 
@@ -69,7 +136,7 @@ export function SocialCredentialsDialog({ isOpen, onClose }: SocialCredentialsDi
   const [inputText, setInputText] = useState('')
   const [preview, setPreview] = useState<Omit<SocialCredential, 'id'>[]>([])
   const [importMode, setImportMode] = useState<'append' | 'replace'>('append')
-  const [filter, setFilter] = useState<'all' | 'github' | 'google'>('all')
+  const [filter, setFilter] = useState<'all' | 'github' | 'google' | 'enterprise'>('all')
   const [showPasswords, setShowPasswords] = useState(false)
   const [message, setMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null)
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set())
@@ -147,7 +214,7 @@ export function SocialCredentialsDialog({ isOpen, onClose }: SocialCredentialsDi
 
   // Check if credential already imported as account
   const isCredentialImported = (cred: SocialCredential): boolean => {
-    const providerValue = cred.type === 'google' ? 'Google' : 'Github'
+    const providerValue = cred.type === 'google' ? 'Google' : cred.type === 'enterprise' ? 'Enterprise' : 'Github'
     return Array.from(accounts.values()).some(
       acc => acc.email === cred.username && acc.credentials.provider === providerValue
     )
@@ -156,7 +223,7 @@ export function SocialCredentialsDialog({ isOpen, onClose }: SocialCredentialsDi
   const filtered = filter === 'all' ? credentials : credentials.filter(c => c.type === filter)
 
   // Clear selection on filter change
-  const handleFilterChange = (value: 'all' | 'github' | 'google') => {
+  const handleFilterChange = (value: 'all' | 'github' | 'google' | 'enterprise') => {
     setFilter(value)
     setSelectedIds(new Set())
   }
@@ -197,7 +264,7 @@ export function SocialCredentialsDialog({ isOpen, onClose }: SocialCredentialsDi
         <div className="flex items-center justify-between px-6 py-4 border-b">
           <div className="flex items-center gap-2">
             <KeyRound className="h-5 w-5 text-primary" />
-            <h2 className="text-lg font-semibold">Social 凭据管理</h2>
+            <h2 className="text-lg font-semibold">凭据管理</h2>
           </div>
           <Button variant="ghost" size="icon" onClick={onClose}><X className="h-4 w-4" /></Button>
         </div>
@@ -215,7 +282,7 @@ export function SocialCredentialsDialog({ isOpen, onClose }: SocialCredentialsDi
             <h3 className="text-sm font-medium">批量导入</h3>
             <textarea
               className="w-full h-28 px-3 py-2 text-sm border rounded-md bg-muted/30 font-mono resize-none focus:outline-none focus:ring-1 focus:ring-primary"
-              placeholder={"GitHub: username----password----totpSecret\nGoogle: number----email----password----recoveryEmail----totpSecret\n或粘贴 JSON 数组"}
+              placeholder={"GitHub: username----password----totpSecret\nGoogle: number----email----password----recoveryEmail----totpSecret\nEnterprise: startUrl----region----name----username----password----totpSecret\n或粘贴 JSON 数组"}
               value={inputText}
               onChange={e => setInputText(e.target.value)}
             />
@@ -225,8 +292,8 @@ export function SocialCredentialsDialog({ isOpen, onClose }: SocialCredentialsDi
                 识别到 {preview.length} 个账号：
                 {preview.map((a, i) => (
                   <span key={i} className="ml-1">
-                    <span className={`inline-block px-1.5 py-0.5 rounded text-[10px] ${a.type === 'google' ? 'bg-yellow-100 text-yellow-700 dark:bg-yellow-900/30 dark:text-yellow-400' : 'bg-blue-100 text-blue-700 dark:bg-blue-900/30 dark:text-blue-400'}`}>
-                      {a.type === 'google' ? 'Google' : 'GitHub'}
+                    <span className={`inline-block px-1.5 py-0.5 rounded text-[10px] ${a.type === 'google' ? 'bg-yellow-100 text-yellow-700 dark:bg-yellow-900/30 dark:text-yellow-400' : a.type === 'enterprise' ? 'bg-purple-100 text-purple-700 dark:bg-purple-900/30 dark:text-purple-400' : 'bg-blue-100 text-blue-700 dark:bg-blue-900/30 dark:text-blue-400'}`}>
+                      {a.type === 'google' ? 'Google' : a.type === 'enterprise' ? 'Enterprise' : 'GitHub'}
                     </span>
                     <span className="ml-0.5">{a.username}</span>
                     {i < preview.length - 1 && '，'}
@@ -275,11 +342,12 @@ export function SocialCredentialsDialog({ isOpen, onClose }: SocialCredentialsDi
                 <select
                   className="text-xs border rounded px-2 py-1 bg-background"
                   value={filter}
-                  onChange={e => handleFilterChange(e.target.value as 'all' | 'github' | 'google')}
+                  onChange={e => handleFilterChange(e.target.value as 'all' | 'github' | 'google' | 'enterprise')}
                 >
                   <option value="all">全部</option>
                   <option value="github">GitHub</option>
                   <option value="google">Google</option>
+                  <option value="enterprise">Enterprise</option>
                 </select>
                 <Button variant="ghost" size="sm" onClick={() => setShowPasswords(!showPasswords)} title={showPasswords ? '隐藏密码' : '显示密码'}>
                   {showPasswords ? <EyeOff className="h-3.5 w-3.5" /> : <Eye className="h-3.5 w-3.5" />}
@@ -303,14 +371,15 @@ export function SocialCredentialsDialog({ isOpen, onClose }: SocialCredentialsDi
                       {selectedIds.has(cred.id) ? <CheckSquare className="h-3.5 w-3.5" /> : <Square className="h-3.5 w-3.5" />}
                     </button>
                     <span className="text-muted-foreground w-5 text-right text-xs">{i + 1}</span>
-                    <span className={`inline-block px-1.5 py-0.5 rounded text-[10px] font-medium shrink-0 ${cred.type === 'google' ? 'bg-yellow-100 text-yellow-700 dark:bg-yellow-900/30 dark:text-yellow-400' : 'bg-blue-100 text-blue-700 dark:bg-blue-900/30 dark:text-blue-400'}`}>
-                      {cred.type === 'google' ? 'Google' : <span className="flex items-center gap-0.5"><Github className="h-2.5 w-2.5" />GitHub</span>}
+                    <span className={`inline-block px-1.5 py-0.5 rounded text-[10px] font-medium shrink-0 ${cred.type === 'google' ? 'bg-yellow-100 text-yellow-700 dark:bg-yellow-900/30 dark:text-yellow-400' : cred.type === 'enterprise' ? 'bg-purple-100 text-purple-700 dark:bg-purple-900/30 dark:text-purple-400' : 'bg-blue-100 text-blue-700 dark:bg-blue-900/30 dark:text-blue-400'}`}>
+                      {cred.type === 'google' ? 'Google' : cred.type === 'enterprise' ? 'Enterprise' : <span className="flex items-center gap-0.5"><Github className="h-2.5 w-2.5" />GitHub</span>}
                     </span>
                     <span className="truncate flex-1 font-mono">{cred.username}</span>
                     {imported && <span className="text-[10px] px-1.5 py-0.5 rounded bg-orange-100 text-orange-600 dark:bg-orange-900/30 dark:text-orange-400 shrink-0">已存在</span>}
                     <span className="text-muted-foreground text-xs w-20 truncate">{showPasswords ? cred.password : '••••••'}</span>
                     <span className="text-muted-foreground text-xs w-8 text-center">{cred.totpSecret ? '2FA' : '-'}</span>
                     {cred.group && <span className="text-muted-foreground text-xs">{cred.group}</span>}
+                    {cred.startUrl && <span className="text-muted-foreground text-xs truncate max-w-[120px]" title={cred.startUrl}>{cred.region || 'us-east-1'}</span>}
                     <Button variant="ghost" size="icon" className="h-6 w-6 opacity-0 group-hover:opacity-100" onClick={() => handleDelete(cred.id)}>
                       <Trash2 className="h-3 w-3 text-destructive" />
                     </Button>

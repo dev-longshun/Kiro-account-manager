@@ -129,7 +129,7 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
   // Social 凭据选择
   const [socialCredentials, setSocialCredentials] = useState<SocialCredential[]>([])
   const [showCredentialPicker, setShowCredentialPicker] = useState(false)
-  const [pendingSocialProvider, setPendingSocialProvider] = useState<'Google' | 'Github' | null>(null)
+  const [pendingSocialProvider, setPendingSocialProvider] = useState<'Google' | 'Github' | 'Enterprise' | null>(null)
 
   // 批量导入模式
   const [batchMode, setBatchMode] = useState(false)
@@ -386,19 +386,22 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
   }
 
   // 启动 IAM SSO 登录 (Authorization Code flow)
-  const handleStartIamSsoLogin = async () => {
-    if (!ssoStartUrl.trim()) {
+  const handleStartIamSsoLogin = async (credentials?: { username: string; password: string; totpSecret?: string }, overrideStartUrl?: string, overrideRegion?: string) => {
+    const effectiveStartUrl = overrideStartUrl || ssoStartUrl.trim()
+    const effectiveRegion = overrideRegion || region
+
+    if (!effectiveStartUrl) {
       setError(isEn ? 'Please enter SSO Start URL' : '请输入 SSO Start URL')
       return
     }
-    
+
     setIsLoggingIn(true)
     setError(null)
     setIamSsoLoginData(null)
 
     try {
-      const result = await window.api.startIamSsoLogin(ssoStartUrl.trim(), region)
-      
+      const result = await window.api.startIamSsoLogin(effectiveStartUrl, effectiveRegion, credentials)
+
       if (result.success && result.authorizeUrl) {
         // 设置登录数据（用于显示等待状态）
         setIamSsoLoginData({
@@ -408,8 +411,7 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
           interval: 3
         })
 
-        // 打开浏览器（支持隐私模式）
-        window.api.openExternal(result.authorizeUrl, usePrivateMode)
+        // 主进程已在隔离 BrowserWindow 中打开授权页面，无需 openExternal
 
         // 开始轮询（等待服务器回调自动完成 token 交换）
         startIamSsoPolling(3)
@@ -432,14 +434,31 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
     pollIntervalRef.current = setInterval(async () => {
       try {
         const result = await window.api.pollIamSsoAuth(region)
-        
+
         if (!result.success) {
-          setError(result.error || (isEn ? 'Authorization failed' : '授权失败'))
-          setIsLoggingIn(false)
-          setIamSsoLoginData(null)
           if (pollIntervalRef.current) {
             clearInterval(pollIntervalRef.current)
             pollIntervalRef.current = null
+          }
+          // 批量模式：记录失败，继续下一个
+          if (batchQueueRef.current.length > 0) {
+            const currentCred = batchQueueRef.current[batchIndexRef.current]
+            setBatchResults(prev => [...prev, { username: currentCred?.username || '?', success: false, error: result.error || '授权失败' }])
+            setBatchDone(prev => prev + 1)
+            batchIndexRef.current++
+            if (batchIndexRef.current < batchQueueRef.current.length) {
+              setIamSsoLoginData(null)
+              setTimeout(() => startNextBatchLogin(), 1000)
+            } else {
+              setIsBatchRunning(false)
+              setIsLoggingIn(false)
+              setIamSsoLoginData(null)
+              batchQueueRef.current = []
+            }
+          } else {
+            setError(result.error || (isEn ? 'Authorization failed' : '授权失败'))
+            setIsLoggingIn(false)
+            setIamSsoLoginData(null)
           }
           return
         }
@@ -449,20 +468,47 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
             clearInterval(pollIntervalRef.current)
             pollIntervalRef.current = null
           }
-          
-          await handleLoginSuccess({
-            accessToken: result.accessToken!,
-            refreshToken: result.refreshToken!,
-            clientId: result.clientId,
-            clientSecret: result.clientSecret,
-            region: result.region,
-            startUrl: ssoStartUrl.trim(),
-            authMethod: 'IdC',
-            provider: 'Enterprise'
-          })
-          
-          setIsLoggingIn(false)
-          setIamSsoLoginData(null)
+
+          const isBatch = batchQueueRef.current.length > 0
+          const currentCred = isBatch ? batchQueueRef.current[batchIndexRef.current] : null
+
+          try {
+            await handleLoginSuccess({
+              accessToken: result.accessToken!,
+              refreshToken: result.refreshToken!,
+              clientId: result.clientId,
+              clientSecret: result.clientSecret,
+              region: result.region,
+              startUrl: currentCred?.startUrl || ssoStartUrl.trim(),
+              authMethod: 'IdC',
+              provider: 'Enterprise'
+            }, isBatch ? { skipCloseAndReset: true } : undefined)
+
+            if (isBatch) {
+              setBatchResults(prev => [...prev, { username: currentCred?.username || '?', success: true }])
+            }
+          } catch (e) {
+            if (isBatch) {
+              setBatchResults(prev => [...prev, { username: currentCred?.username || '?', success: false, error: e instanceof Error ? e.message : '添加失败' }])
+            }
+          }
+
+          if (isBatch) {
+            setBatchDone(prev => prev + 1)
+            batchIndexRef.current++
+            if (batchIndexRef.current < batchQueueRef.current.length) {
+              setIamSsoLoginData(null)
+              setTimeout(() => startNextBatchLogin(), 1000)
+            } else {
+              setIsBatchRunning(false)
+              setIsLoggingIn(false)
+              setIamSsoLoginData(null)
+              batchQueueRef.current = []
+            }
+          } else {
+            setIsLoggingIn(false)
+            setIamSsoLoginData(null)
+          }
         }
         // 如果是 pending 或 slow_down，继续轮询
       } catch (e) {
@@ -580,21 +626,31 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
     if (idx >= queue.length) return
 
     const cred = queue[idx]
-    const socialProvider = cred.type === 'google' ? 'Google' as const : 'Github' as const
-    setLoginType(socialProvider === 'Google' ? 'google' : 'github')
-    handleStartSocialLogin(socialProvider, {
-      username: cred.username,
-      password: cred.password,
-      totpSecret: cred.totpSecret
-    })
+    if (cred.type === 'enterprise') {
+      // Enterprise SSO：使用隔离窗口 + auto-fill
+      setLoginType('iamsso')
+      handleStartIamSsoLogin(
+        { username: cred.username, password: cred.password, totpSecret: cred.totpSecret },
+        cred.startUrl,
+        cred.region || 'us-east-1'
+      )
+    } else {
+      const socialProvider = cred.type === 'google' ? 'Google' as const : 'Github' as const
+      setLoginType(socialProvider === 'Google' ? 'google' : 'github')
+      handleStartSocialLogin(socialProvider, {
+        username: cred.username,
+        password: cred.password,
+        totpSecret: cred.totpSecret
+      })
+    }
   }
 
   // 批量导入：开始
   const startBatchImport = () => {
     if (!pendingSocialProvider || batchSelectedIds.size === 0) return
 
-    const providerType = pendingSocialProvider === 'Google' ? 'google' : 'github'
-    const providerValue = pendingSocialProvider === 'Google' ? 'Google' : 'Github'
+    const providerType = pendingSocialProvider === 'Google' ? 'google' : pendingSocialProvider === 'Enterprise' ? 'enterprise' : 'github'
+    const providerValue = pendingSocialProvider === 'Google' ? 'Google' : pendingSocialProvider === 'Enterprise' ? 'Enterprise' : 'Github'
 
     // 过滤掉已存在的账号
     const queue = socialCredentials
@@ -1377,7 +1433,13 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
                     <button 
                       className="group w-full h-14 flex items-center px-4 gap-4 bg-background hover:bg-muted border border-border rounded-xl transition-all duration-200 hover:shadow-md hover:border-primary/30"
                       onClick={() => {
-                        setLoginType('iamsso')
+                        const available = socialCredentials.filter(c => c.type === 'enterprise')
+                        if (available.length > 0) {
+                          setPendingSocialProvider('Enterprise' as 'Google' | 'Github')
+                          setShowCredentialPicker(true)
+                        } else {
+                          setLoginType('iamsso')
+                        }
                       }}
                     >
                       <div className="w-8 h-8 flex items-center justify-center bg-white dark:bg-slate-800 rounded-full shadow-sm border dark:border-slate-600 p-1.5 group-hover:scale-110 transition-transform">
@@ -1999,8 +2061,8 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
             </div>
             <div className="flex-1 overflow-y-auto p-3 space-y-1.5">
               {batchMode && (() => {
-                const providerType = pendingSocialProvider === 'Google' ? 'google' : 'github'
-                const providerValue = pendingSocialProvider === 'Google' ? 'Google' : 'Github'
+                const providerType = pendingSocialProvider === 'Google' ? 'google' : pendingSocialProvider === 'Enterprise' ? 'enterprise' : 'github'
+                const providerValue = pendingSocialProvider === 'Google' ? 'Google' : pendingSocialProvider === 'Enterprise' ? 'Enterprise' : 'Github'
                 const available = socialCredentials.filter(c => c.type === providerType && !Array.from(accounts.values()).some(acc => acc.email === c.username && acc.credentials.provider === providerValue))
                 const allSelected = available.length > 0 && available.every(c => batchSelectedIds.has(c.id))
                 return (
@@ -2022,9 +2084,9 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
                 )
               })()}
               {socialCredentials
-                .filter(c => c.type === (pendingSocialProvider === 'Google' ? 'google' : 'github'))
+                .filter(c => c.type === (pendingSocialProvider === 'Google' ? 'google' : pendingSocialProvider === 'Enterprise' ? 'enterprise' : 'github'))
                 .map(cred => {
-                  const providerValue = pendingSocialProvider === 'Google' ? 'Google' : 'Github'
+                  const providerValue = pendingSocialProvider === 'Google' ? 'Google' : pendingSocialProvider === 'Enterprise' ? 'Enterprise' : 'Github'
                   const exists = Array.from(accounts.values()).some(
                     acc => acc.email === cred.username && acc.credentials.provider === providerValue
                   )
@@ -2055,6 +2117,7 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
                         <div className="flex-1 min-w-0">
                           <div className="text-sm font-medium truncate">{cred.name || cred.username}</div>
                           <div className="text-xs text-muted-foreground truncate">{cred.username}</div>
+                          {cred.startUrl && <div className="text-[10px] text-muted-foreground truncate">{cred.startUrl} ({cred.region || 'us-east-1'})</div>}
                         </div>
                         {exists && <span className="text-[10px] px-1.5 py-0.5 rounded bg-orange-100 text-orange-600 dark:bg-orange-900/30 dark:text-orange-400 shrink-0">{isEn ? 'Exists' : '已存在'}</span>}
                         {cred.totpSecret && <span className="text-[10px] px-1.5 py-0.5 rounded bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-400 shrink-0">2FA</span>}
@@ -2070,17 +2133,29 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
                         : 'hover:bg-muted/50 hover:border-primary/30'
                     }`}
                     onClick={() => {
-                      setLoginType(pendingSocialProvider === 'Google' ? 'google' : 'github')
-                      handleStartSocialLogin(pendingSocialProvider, {
-                        username: cred.username,
-                        password: cred.password,
-                        totpSecret: cred.totpSecret
-                      })
+                      if (pendingSocialProvider === 'Enterprise') {
+                        setLoginType('iamsso')
+                        setShowCredentialPicker(false)
+                        setPendingSocialProvider(null)
+                        handleStartIamSsoLogin(
+                          { username: cred.username, password: cred.password, totpSecret: cred.totpSecret },
+                          cred.startUrl,
+                          cred.region || 'us-east-1'
+                        )
+                      } else {
+                        setLoginType(pendingSocialProvider === 'Google' ? 'google' : 'github')
+                        handleStartSocialLogin(pendingSocialProvider as 'Google' | 'Github', {
+                          username: cred.username,
+                          password: cred.password,
+                          totpSecret: cred.totpSecret
+                        })
+                      }
                     }}
                   >
                     <div className="flex-1 min-w-0">
                       <div className="text-sm font-medium truncate">{cred.name || cred.username}</div>
                       <div className="text-xs text-muted-foreground truncate">{cred.username}</div>
+                      {cred.startUrl && <div className="text-[10px] text-muted-foreground truncate">{cred.startUrl} ({cred.region || 'us-east-1'})</div>}
                     </div>
                     {exists && <span className="text-[10px] px-1.5 py-0.5 rounded bg-orange-100 text-orange-600 dark:bg-orange-900/30 dark:text-orange-400 shrink-0">{isEn ? 'Exists' : '已存在'}</span>}
                     {cred.totpSecret && <span className="text-[10px] px-1.5 py-0.5 rounded bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-400 shrink-0">2FA</span>}
@@ -2104,10 +2179,16 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
                   size="sm"
                   className="w-full"
                   onClick={() => {
-                    setLoginType(pendingSocialProvider === 'Google' ? 'google' : 'github')
-                    setShowCredentialPicker(false)
-                    setPendingSocialProvider(null)
-                    handleStartSocialLogin(pendingSocialProvider!)
+                    if (pendingSocialProvider === 'Enterprise') {
+                      setLoginType('iamsso')
+                      setShowCredentialPicker(false)
+                      setPendingSocialProvider(null)
+                    } else {
+                      setLoginType(pendingSocialProvider === 'Google' ? 'google' : 'github')
+                      setShowCredentialPicker(false)
+                      setPendingSocialProvider(null)
+                      handleStartSocialLogin(pendingSocialProvider as 'Google' | 'Github')
+                    }
                   }}
                 >
                   {isEn ? 'Login manually (no auto-fill)' : '手动登录（不自动填充）'}
