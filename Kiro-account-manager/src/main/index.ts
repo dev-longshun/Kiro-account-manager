@@ -3665,7 +3665,9 @@ app.whenReady().then(async () => {
     region?: string
     expiresIn?: number
     error?: string
+    newPassword?: string
   } | null = null
+  let pendingNewPassword: string | null = null
 
   // IPC: 启动 IAM Identity Center SSO 登录 (使用 Authorization Code Grant with PKCE)
   ipcMain.handle('start-iam-sso-login', async (_event, startUrl: string, region: string = 'us-east-1', credentials?: OAuthCredentials) => {
@@ -3905,7 +3907,23 @@ app.whenReady().then(async () => {
 
       // 如果提供了凭据，启动自动填充
       if (credentials) {
-        startAutoFill(oauthWin.webContents, 'Enterprise', credentials)
+        startAutoFill(oauthWin.webContents, 'Enterprise', credentials, async (newPassword: string) => {
+          console.log('[Login] New password was set during auto-login for:', credentials.username)
+          pendingNewPassword = newPassword
+          // 将新密码写入 socialCredentials store（保留初始密码不动）
+          try {
+            await initStore()
+            const list = (store!.get('socialCredentials', []) as Array<{ username: string; type: string; startUrl?: string; password: string; newPassword?: string }>)
+            const idx = list.findIndex(c => c.username === credentials.username && c.type === 'enterprise')
+            if (idx >= 0) {
+              list[idx].newPassword = newPassword
+              store!.set('socialCredentials', list)
+              console.log('[Login] Social credential newPassword saved in store (initial password preserved)')
+            }
+          } catch (e) {
+            console.error('[Login] Failed to update credential password:', e)
+          }
+        })
       }
 
       // 返回成功（不再返回 authorizeUrl，前端不需要 openExternal 了）
@@ -3940,6 +3958,11 @@ app.whenReady().then(async () => {
     if (iamSsoResult) {
       const result = { ...iamSsoResult }
       if (result.completed) {
+        // 附带新密码（如果在登录过程中设置了新密码）
+        if (pendingNewPassword) {
+          result.newPassword = pendingNewPassword
+          pendingNewPassword = null
+        }
         // 清理状态
         if (iamSsoServer) {
           iamSsoServer.close()
@@ -3963,6 +3986,7 @@ app.whenReady().then(async () => {
       iamSsoServer = null
     }
     iamSsoResult = null
+    pendingNewPassword = null
     currentLoginState = null
     return { success: true }
   })

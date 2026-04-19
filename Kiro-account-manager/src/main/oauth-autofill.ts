@@ -7,7 +7,7 @@
  * Ported from github-account-switcher browser extension.
  */
 
-import { createHmac } from 'crypto'
+import { createHmac, randomBytes } from 'crypto'
 import type { WebContents } from 'electron'
 
 // ---------------------------------------------------------------------------
@@ -68,6 +68,38 @@ const STEP_TIMEOUT = 20_000 // 20s per step
 
 /** Delay helper */
 const delay = (ms: number) => new Promise<void>((r) => setTimeout(r, ms))
+
+/**
+ * 生成符合 AWS IAM Identity Center 密码策略的强密码。
+ * 要求：8-64 字符，大写 + 小写 + 数字 + 特殊字符。
+ */
+function generateStrongPassword(length = 16): string {
+  const upper = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'
+  const lower = 'abcdefghijklmnopqrstuvwxyz'
+  const digits = '0123456789'
+  const special = '!@#$%^&*'
+  const all = upper + lower + digits + special
+
+  // 保证每类至少 1 个
+  const chars: string[] = [
+    upper[randomBytes(1)[0] % upper.length],
+    lower[randomBytes(1)[0] % lower.length],
+    digits[randomBytes(1)[0] % digits.length],
+    special[randomBytes(1)[0] % special.length],
+  ]
+  // 填充剩余
+  const remaining = randomBytes(length - 4)
+  for (let i = 0; i < remaining.length; i++) {
+    chars.push(all[remaining[i] % all.length])
+  }
+  // Fisher-Yates 洗牌
+  const shuffleBytes = randomBytes(chars.length)
+  for (let i = chars.length - 1; i > 0; i--) {
+    const j = shuffleBytes[i] % (i + 1)
+    ;[chars[i], chars[j]] = [chars[j], chars[i]]
+  }
+  return chars.join('')
+}
 
 /**
  * Execute JS in webContents and return the result.
@@ -502,6 +534,61 @@ async function enterpriseFillPassword(wc: WebContents, password: string): Promis
   return true
 }
 
+/**
+ * 检测并填充"设置新密码"页面。
+ * 返回生成的新密码字符串，未检测到则返回 null。
+ */
+async function enterpriseFillNewPassword(wc: WebContents): Promise<string | null> {
+  const hasNewPwdPage = await exec(wc, `
+    (function() {
+      var newPwdInput = document.querySelector('awsui-input[data-testid="test-new-password-input"] input')
+        || document.querySelector('input[data-testid="test-new-password-input"]');
+      if (!newPwdInput) return false;
+      var style = window.getComputedStyle(newPwdInput);
+      return style.display !== 'none' && style.visibility !== 'hidden' && newPwdInput.offsetParent !== null;
+    })()
+  `)
+  if (!hasNewPwdPage) return null
+
+  await delay(800)
+  const newPassword = generateStrongPassword()
+
+  // 填充新密码
+  await exec(wc, `
+    ${INJECT_SET_NATIVE_VALUE}
+    var newPwd = document.querySelector('awsui-input[data-testid="test-new-password-input"] input')
+      || document.querySelector('input[data-testid="test-new-password-input"]');
+    if (newPwd) __setNativeValue(newPwd, ${JSON.stringify(newPassword)});
+  `)
+  await delay(300)
+
+  // 填充确认密码
+  await exec(wc, `
+    ${INJECT_SET_NATIVE_VALUE}
+    var confirmPwd = document.querySelector('awsui-input[data-testid="test-retype-new-password-input"] input')
+      || document.querySelector('input[data-testid="test-retype-new-password-input"]');
+    if (confirmPwd) __setNativeValue(confirmPwd, ${JSON.stringify(newPassword)});
+  `)
+  await delay(500)
+
+  // 点击提交按钮
+  const submitSels = JSON.stringify(ENTERPRISE_SUBMIT_SELECTORS)
+  await exec(wc, `
+    var sels = ${submitSels};
+    var btn = null;
+    for (var i = 0; i < sels.length && !btn; i++) {
+      var els = document.querySelectorAll(sels[i]);
+      for (var j = 0; j < els.length; j++) {
+        var el = els[j];
+        var s = window.getComputedStyle(el);
+        if (s.display !== 'none' && s.visibility !== 'hidden' && el.offsetParent !== null) { btn = el; break; }
+      }
+    }
+    if (btn) btn.click();
+  `)
+  return newPassword
+}
+
 async function enterpriseFill2FA(wc: WebContents, totpSecret: string): Promise<boolean> {
   const selectorList = JSON.stringify(ENTERPRISE_TOTP_SELECTORS)
   const has2FA = await exec(wc, `
@@ -587,7 +674,8 @@ async function enterpriseFill2FA(wc: WebContents, totpSecret: string): Promise<b
 export function startAutoFill(
   webContents: WebContents,
   provider: 'Github' | 'Google' | 'Enterprise',
-  credentials: OAuthCredentials
+  credentials: OAuthCredentials,
+  onNewPassword?: (newPassword: string) => void
 ): void {
   let loginDone = false
   let twofaDone = false
@@ -688,7 +776,28 @@ export function startAutoFill(
           }
         }
 
-        // Step 3: 2FA（密码提交后继续等待 MFA 页面渲染）
+        // Step 3: 检测"设置新密码"页面（密码提交后可能出现）
+        if (loginDone) {
+          await delay(1500)
+          if (destroyed) return
+          let capturedNewPassword: string | null = null
+          const newPwdHandled = await waitAndFill(webContents, destroyed, async () => {
+            const result = await enterpriseFillNewPassword(webContents)
+            if (result) {
+              capturedNewPassword = result
+              return true
+            }
+            return false
+          }, 10000, 800)
+          if (newPwdHandled && capturedNewPassword) {
+            log('new password set & submitted')
+            if (onNewPassword) onNewPassword(capturedNewPassword)
+            await delay(2000)
+            if (destroyed) return
+          }
+        }
+
+        // Step 4: 2FA（密码提交后继续等待 MFA 页面渲染）
         if (loginDone && !twofaDone && credentials.totpSecret) {
           await delay(1500)
           if (destroyed) return
@@ -701,7 +810,7 @@ export function startAutoFill(
           }
         }
 
-        // Step 4: 自动点击授权按钮（Allow access）
+        // Step 5: 自动点击授权按钮（Allow access）
         if (loginDone && (twofaDone || !credentials.totpSecret)) {
           await delay(1500)
           if (destroyed) return

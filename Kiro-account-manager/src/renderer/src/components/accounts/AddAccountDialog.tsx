@@ -137,9 +137,10 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
   const [isBatchRunning, setIsBatchRunning] = useState(false)
   const [batchTotal, setBatchTotal] = useState(0)
   const [batchDone, setBatchDone] = useState(0)
-  const [batchResults, setBatchResults] = useState<{username: string; success: boolean; error?: string}[]>([])
+  const [batchResults, setBatchResults] = useState<{username: string; success: boolean; error?: string; newPassword?: string}[]>([])
   const batchQueueRef = useRef<SocialCredential[]>([])
   const batchIndexRef = useRef(0)
+  const currentSsoUsernameRef = useRef<string | undefined>(undefined)
 
   // 加载 social 凭据
   const loadSocialCredentials = useCallback(async () => {
@@ -260,6 +261,7 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
     startUrl?: string
     authMethod?: string
     provider?: string
+    ssoUsername?: string
   }, options?: { skipCloseAndReset?: boolean }) => {
     console.log('[AddAccountDialog] Login successful, verifying credentials...')
     
@@ -296,6 +298,7 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
           email,
           userId,
           nickname: email ? email.split('@')[0] : undefined,
+          ssoUsername: tokenData.ssoUsername,
           idp: providerName as 'BuilderId' | 'Google' | 'Github',
           credentials: {
             accessToken: result.data.accessToken,
@@ -390,6 +393,9 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
     const effectiveStartUrl = overrideStartUrl || ssoStartUrl.trim()
     const effectiveRegion = overrideRegion || region
 
+    // 记录当前登录的 SSO 用户名
+    currentSsoUsernameRef.current = credentials?.username
+
     if (!effectiveStartUrl) {
       setError(isEn ? 'Please enter SSO Start URL' : '请输入 SSO Start URL')
       return
@@ -481,11 +487,12 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
               region: result.region,
               startUrl: currentCred?.startUrl || ssoStartUrl.trim(),
               authMethod: 'IdC',
-              provider: 'Enterprise'
+              provider: 'Enterprise',
+              ssoUsername: currentCred?.username || currentSsoUsernameRef.current
             }, isBatch ? { skipCloseAndReset: true } : undefined)
 
             if (isBatch) {
-              setBatchResults(prev => [...prev, { username: currentCred?.username || '?', success: true }])
+              setBatchResults(prev => [...prev, { username: currentCred?.username || '?', success: true, newPassword: result.newPassword }])
             }
           } catch (e) {
             if (isBatch) {
@@ -1147,6 +1154,7 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
     setBatchResults([])
     batchQueueRef.current = []
     batchIndexRef.current = 0
+    currentSsoUsernameRef.current = undefined
   }
 
   if (!isOpen) return null
@@ -1238,6 +1246,19 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
                           ? <CheckCircle2 className="h-3.5 w-3.5 text-green-500 shrink-0" />
                           : <XCircle className="h-3.5 w-3.5 text-red-500 shrink-0" />}
                         <span className="truncate font-mono">{r.username}</span>
+                        {r.newPassword && (
+                          <button
+                            className="text-amber-500 hover:text-amber-600 text-xs ml-auto shrink-0 cursor-pointer"
+                            title={isEn ? 'Click to copy new password' : '点击复制新密码'}
+                            onClick={async () => {
+                              await navigator.clipboard.writeText(r.newPassword!)
+                              const el = document.getElementById(`pwd-copied-${i}`)
+                              if (el) { el.textContent = isEn ? 'Copied' : '已复制'; setTimeout(() => { el.textContent = isEn ? '[Password Updated]' : '[密码已更新]' }, 1500) }
+                            }}
+                          >
+                            <span id={`pwd-copied-${i}`}>{isEn ? '[Password Updated]' : '[密码已更新]'}</span>
+                          </button>
+                        )}
                         {r.error && <span className="text-red-500 truncate ml-auto">{r.error}</span>}
                       </div>
                     ))}
@@ -1526,7 +1547,7 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
                       </div>
                       <Button 
                         className="w-full"
-                        onClick={handleStartIamSsoLogin}
+                        onClick={() => handleStartIamSsoLogin()}
                         disabled={!ssoStartUrl.trim() || isLoggingIn}
                       >
                         {isLoggingIn ? (isEn ? 'Starting...' : '启动中...') : (isEn ? 'Start Login' : '开始登录')}

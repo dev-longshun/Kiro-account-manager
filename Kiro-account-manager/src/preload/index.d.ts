@@ -355,6 +355,7 @@ interface KiroApi {
     region?: string
     expiresIn?: number
     error?: string
+    newPassword?: string
   }>
 
   // 取消 IAM SSO 登录

@@ -104,6 +104,7 @@ export interface Account {
   visitorId?: string
   machineId?: string // 账户绑定的设备 ID（64位十六进制）
   profileArn?: string // AWS Profile ARN
+  ssoUsername?: string // Enterprise SSO 登录用户名（如 IAM Identity Center 用户名）
 
   // 认证信息
   credentials: AccountCredentials
