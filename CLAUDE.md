@@ -5,7 +5,7 @@
 - **技术栈**：Electron + React + TypeScript + Zustand + Tailwind CSS + Vite (electron-vite)
 - **最低支持版本**：Node.js >= 18, npm >= 9
 - **许可证**：AGPL-3.0
-- **当前版本**：v1.5.0
+- **当前版本**：v1.6.0
 
 ## 项目结构
 
