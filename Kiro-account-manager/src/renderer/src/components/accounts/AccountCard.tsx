@@ -501,6 +501,11 @@ export const AccountCard = memo(function AccountCard({
                  </div>
               </div>
               <div className="flex items-center gap-2 mt-1">
+                  {account.ssoUsername && (
+                    <span className="text-[10px] px-1.5 py-0.5 rounded bg-purple-100 text-purple-700 dark:bg-purple-900/30 dark:text-purple-400 font-medium shrink-0">
+                      SSO: {account.ssoUsername}
+                    </span>
+                  )}
                   {account.nickname && <span className="text-xs text-muted-foreground truncate">{maskNickname(account.nickname)}</span>}
                   {accountGroup && (
                     <span

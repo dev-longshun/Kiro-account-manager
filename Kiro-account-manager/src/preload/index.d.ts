@@ -336,7 +336,7 @@ interface KiroApi {
   cancelBuilderIdLogin: () => Promise<{ success: boolean }>
 
   // 启动 IAM Identity Center SSO 登录 (Authorization Code flow)
-  startIamSsoLogin: (startUrl: string, region?: string) => Promise<{
+  startIamSsoLogin: (startUrl: string, region?: string, credentials?: { username: string; password: string; totpSecret?: string }) => Promise<{
     success: boolean
     authorizeUrl?: string
     expiresIn?: number
@@ -355,6 +355,7 @@ interface KiroApi {
     region?: string
     expiresIn?: number
     error?: string
+    newPassword?: string
   }>
 
   // 取消 IAM SSO 登录
@@ -766,10 +767,10 @@ interface KiroApi {
   // ============ Social 凭据管理 ============
 
   // 保存 Social 凭据列表
-  saveSocialCredentials: (credentials: Array<{ id: string; type: string; name: string; username: string; password: string; totpSecret?: string; group?: string; recoveryEmail?: string }>) => Promise<{ success: boolean; error?: string }>
+  saveSocialCredentials: (credentials: Array<{ id: string; type: string; name: string; username: string; password: string; totpSecret?: string; group?: string; recoveryEmail?: string; startUrl?: string; region?: string }>) => Promise<{ success: boolean; error?: string }>
 
   // 读取 Social 凭据列表
-  loadSocialCredentials: () => Promise<{ success: boolean; credentials: Array<{ id: string; type: string; name: string; username: string; password: string; totpSecret?: string; group?: string; recoveryEmail?: string }>; error?: string }>
+  loadSocialCredentials: () => Promise<{ success: boolean; credentials: Array<{ id: string; type: string; name: string; username: string; password: string; totpSecret?: string; group?: string; recoveryEmail?: string; startUrl?: string; region?: string }>; error?: string }>
 
   // 删除单个 Social 凭据
   deleteSocialCredential: (id: string) => Promise<{ success: boolean; error?: string }>

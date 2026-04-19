@@ -7,7 +7,7 @@
  * Ported from github-account-switcher browser extension.
  */
 
-import { createHmac } from 'crypto'
+import { createHmac, randomBytes } from 'crypto'
 import type { WebContents } from 'electron'
 
 // ---------------------------------------------------------------------------
@@ -68,6 +68,38 @@ const STEP_TIMEOUT = 20_000 // 20s per step
 
 /** Delay helper */
 const delay = (ms: number) => new Promise<void>((r) => setTimeout(r, ms))
+
+/**
+ * 生成符合 AWS IAM Identity Center 密码策略的强密码。
+ * 要求：8-64 字符，大写 + 小写 + 数字 + 特殊字符。
+ */
+function generateStrongPassword(length = 16): string {
+  const upper = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'
+  const lower = 'abcdefghijklmnopqrstuvwxyz'
+  const digits = '0123456789'
+  const special = '!@#$%^&*'
+  const all = upper + lower + digits + special
+
+  // 保证每类至少 1 个
+  const chars: string[] = [
+    upper[randomBytes(1)[0] % upper.length],
+    lower[randomBytes(1)[0] % lower.length],
+    digits[randomBytes(1)[0] % digits.length],
+    special[randomBytes(1)[0] % special.length],
+  ]
+  // 填充剩余
+  const remaining = randomBytes(length - 4)
+  for (let i = 0; i < remaining.length; i++) {
+    chars.push(all[remaining[i] % all.length])
+  }
+  // Fisher-Yates 洗牌
+  const shuffleBytes = randomBytes(chars.length)
+  for (let i = chars.length - 1; i > 0; i--) {
+    const j = shuffleBytes[i] % (i + 1)
+    ;[chars[i], chars[j]] = [chars[j], chars[i]]
+  }
+  return chars.join('')
+}
 
 /**
  * Execute JS in webContents and return the result.
@@ -304,6 +336,331 @@ async function googleFill2FA(wc: WebContents, totpSecret: string): Promise<boole
 }
 
 // ---------------------------------------------------------------------------
+// Enterprise (IAM Identity Center) Auto-Fill
+// ---------------------------------------------------------------------------
+
+/** Generic selectors for common IdP login pages (AWS SSO portal, Okta, Azure AD, etc.) */
+const ENTERPRISE_USERNAME_SELECTORS = [
+  // AWS IAM Identity Center (awsui 组件库)
+  'input.awsui-input-type-text',
+  'input[id^="awsui-input-"]',
+  // AWS Cognito
+  'input#signInFormUsername',
+  'input[name="signInFormUsername"]',
+  // 通用
+  'input[name="username"]',
+  'input[name="email"]',
+  'input[type="email"]',
+  'input[name="loginfmt"]',           // Azure AD
+  'input[name="identifier"]',         // Okta
+  'input[id="username"]',
+  'input[id="email"]',
+  'input[id="identifierId"]',         // Google-based IdP
+  'input[type="text"][autocomplete="username"]',
+  'input[type="text"][name*="user"]',
+  'input[type="text"][name*="email"]',
+  'input[type="email"][autocomplete="email"]',
+]
+
+const ENTERPRISE_PASSWORD_SELECTORS = [
+  // AWS Cognito / IAM Identity Center (优先)
+  'input#signInFormPassword',
+  'input[name="signInFormPassword"]',
+  // 通用
+  'input[type="password"]',
+  'input[name="password"]',
+  'input[name="passwd"]',             // Azure AD
+  'input[id="password"]',
+  'input[id="passwordInput"]',
+]
+
+const ENTERPRISE_SUBMIT_SELECTORS = [
+  // AWS IAM Identity Center (awsui 组件库)
+  'button.awsui-button-variant-primary',
+  'button[data-testid="submit-button"]',
+  'button.awsui-button[type="submit"]',
+  // AWS Cognito
+  'input[name="signInSubmitButton"]',
+  'button[name="signInSubmitButton"]',
+  // 通用
+  'button[type="submit"]',
+  'input[type="submit"]',
+  'button.btn-primary',
+  '#next-btn',
+  '[data-action="submit"]',
+]
+
+const ENTERPRISE_TOTP_SELECTORS = [
+  // AWS IAM Identity Center (awsui 组件库)
+  'input[placeholder="Enter code"]',
+  'input[placeholder*="code" i]',
+  'input[placeholder*="验证码"]',
+  // 通用
+  'input[name="verificationCode"]',
+  'input[name="otpCode"]',
+  'input[name="code"]',
+  'input[name="otp"]',
+  'input[name="mfaCode"]',
+  'input[name="passcode"]',           // Okta
+  'input[type="tel"]',
+  'input[autocomplete="one-time-code"]',
+  'input[type="text"][maxlength="6"]',
+  'input[type="text"][inputmode="numeric"]',
+  'input[type="number"][maxlength="6"]',
+  'input[type="text"][name*="totp"]',
+  'input[type="text"][name*="mfa"]',
+]
+
+async function enterpriseFillUsername(wc: WebContents, username: string): Promise<boolean> {
+  const selectorList = JSON.stringify(ENTERPRISE_USERNAME_SELECTORS)
+  const hasUsername = await exec(wc, `
+    (function() {
+      var sels = ${selectorList};
+      for (var i = 0; i < sels.length; i++) {
+        var els = document.querySelectorAll(sels[i]);
+        for (var j = 0; j < els.length; j++) {
+          var el = els[j];
+          var style = window.getComputedStyle(el);
+          if (style.display !== 'none' && style.visibility !== 'hidden' && el.offsetParent !== null) return true;
+        }
+      }
+      return false;
+    })()
+  `)
+  if (!hasUsername) return false
+
+  // 检查当前页面是否同时有可见的密码框（单页登录）
+  const hasPwd = await exec(wc, `
+    (function() {
+      var sels = ${JSON.stringify(ENTERPRISE_PASSWORD_SELECTORS)};
+      for (var i = 0; i < sels.length; i++) {
+        var els = document.querySelectorAll(sels[i]);
+        for (var j = 0; j < els.length; j++) {
+          var el = els[j];
+          var style = window.getComputedStyle(el);
+          if (style.display !== 'none' && style.visibility !== 'hidden' && el.offsetParent !== null) return true;
+        }
+      }
+      return false;
+    })()
+  `)
+
+  await delay(800)
+  await exec(wc, `
+    ${INJECT_SET_NATIVE_VALUE}
+    var sels = ${selectorList};
+    var input = null;
+    for (var i = 0; i < sels.length && !input; i++) {
+      var els = document.querySelectorAll(sels[i]);
+      for (var j = 0; j < els.length; j++) {
+        var el = els[j];
+        var s = window.getComputedStyle(el);
+        if (s.display !== 'none' && s.visibility !== 'hidden' && el.offsetParent !== null) { input = el; break; }
+      }
+    }
+    if (input) __setNativeValue(input, ${JSON.stringify(username)});
+  `)
+
+  // 如果同时有密码框可见，说明是单页登录，不提交（等 fillPassword 一起处理）
+  if (hasPwd) return true
+
+  await delay(500)
+  const submitSels = JSON.stringify(ENTERPRISE_SUBMIT_SELECTORS)
+  await exec(wc, `
+    var sels = ${submitSels};
+    var btn = null;
+    for (var i = 0; i < sels.length && !btn; i++) {
+      var els = document.querySelectorAll(sels[i]);
+      for (var j = 0; j < els.length; j++) {
+        var el = els[j];
+        var s = window.getComputedStyle(el);
+        if (s.display !== 'none' && s.visibility !== 'hidden' && el.offsetParent !== null) { btn = el; break; }
+      }
+    }
+    if (btn) btn.click();
+  `)
+  return true
+}
+
+async function enterpriseFillPassword(wc: WebContents, password: string): Promise<boolean> {
+  const selectorList = JSON.stringify(ENTERPRISE_PASSWORD_SELECTORS)
+  const hasPwd = await exec(wc, `
+    (function() {
+      var sels = ${selectorList};
+      for (var i = 0; i < sels.length; i++) {
+        var els = document.querySelectorAll(sels[i]);
+        for (var j = 0; j < els.length; j++) {
+          var el = els[j];
+          var style = window.getComputedStyle(el);
+          if (style.display !== 'none' && style.visibility !== 'hidden' && el.offsetParent !== null) return true;
+        }
+      }
+      return false;
+    })()
+  `)
+  if (!hasPwd) return false
+
+  await delay(800)
+  await exec(wc, `
+    ${INJECT_SET_NATIVE_VALUE}
+    var sels = ${selectorList};
+    var input = null;
+    for (var i = 0; i < sels.length && !input; i++) {
+      var els = document.querySelectorAll(sels[i]);
+      for (var j = 0; j < els.length; j++) {
+        var el = els[j];
+        var s = window.getComputedStyle(el);
+        if (s.display !== 'none' && s.visibility !== 'hidden' && el.offsetParent !== null) { input = el; break; }
+      }
+    }
+    if (input) __setNativeValue(input, ${JSON.stringify(password)});
+  `)
+  await delay(500)
+  var submitSels = JSON.stringify(ENTERPRISE_SUBMIT_SELECTORS)
+  await exec(wc, `
+    var sels = ${submitSels};
+    var btn = null;
+    for (var i = 0; i < sels.length && !btn; i++) {
+      var els = document.querySelectorAll(sels[i]);
+      for (var j = 0; j < els.length; j++) {
+        var el = els[j];
+        var s = window.getComputedStyle(el);
+        if (s.display !== 'none' && s.visibility !== 'hidden' && el.offsetParent !== null) { btn = el; break; }
+      }
+    }
+    if (btn) btn.click();
+    else { var f = document.querySelector('form'); if (f) f.submit(); }
+  `)
+  return true
+}
+
+/**
+ * 检测并填充"设置新密码"页面。
+ * 返回生成的新密码字符串，未检测到则返回 null。
+ */
+async function enterpriseFillNewPassword(wc: WebContents): Promise<string | null> {
+  const hasNewPwdPage = await exec(wc, `
+    (function() {
+      var newPwdInput = document.querySelector('awsui-input[data-testid="test-new-password-input"] input')
+        || document.querySelector('input[data-testid="test-new-password-input"]');
+      if (!newPwdInput) return false;
+      var style = window.getComputedStyle(newPwdInput);
+      return style.display !== 'none' && style.visibility !== 'hidden' && newPwdInput.offsetParent !== null;
+    })()
+  `)
+  if (!hasNewPwdPage) return null
+
+  await delay(800)
+  const newPassword = generateStrongPassword()
+
+  // 填充新密码
+  await exec(wc, `
+    ${INJECT_SET_NATIVE_VALUE}
+    var newPwd = document.querySelector('awsui-input[data-testid="test-new-password-input"] input')
+      || document.querySelector('input[data-testid="test-new-password-input"]');
+    if (newPwd) __setNativeValue(newPwd, ${JSON.stringify(newPassword)});
+  `)
+  await delay(300)
+
+  // 填充确认密码
+  await exec(wc, `
+    ${INJECT_SET_NATIVE_VALUE}
+    var confirmPwd = document.querySelector('awsui-input[data-testid="test-retype-new-password-input"] input')
+      || document.querySelector('input[data-testid="test-retype-new-password-input"]');
+    if (confirmPwd) __setNativeValue(confirmPwd, ${JSON.stringify(newPassword)});
+  `)
+  await delay(500)
+
+  // 点击提交按钮
+  const submitSels = JSON.stringify(ENTERPRISE_SUBMIT_SELECTORS)
+  await exec(wc, `
+    var sels = ${submitSels};
+    var btn = null;
+    for (var i = 0; i < sels.length && !btn; i++) {
+      var els = document.querySelectorAll(sels[i]);
+      for (var j = 0; j < els.length; j++) {
+        var el = els[j];
+        var s = window.getComputedStyle(el);
+        if (s.display !== 'none' && s.visibility !== 'hidden' && el.offsetParent !== null) { btn = el; break; }
+      }
+    }
+    if (btn) btn.click();
+  `)
+  return newPassword
+}
+
+async function enterpriseFill2FA(wc: WebContents, totpSecret: string): Promise<boolean> {
+  const selectorList = JSON.stringify(ENTERPRISE_TOTP_SELECTORS)
+  const has2FA = await exec(wc, `
+    (function() {
+      var sels = ${selectorList};
+      for (var i = 0; i < sels.length; i++) {
+        var els = document.querySelectorAll(sels[i]);
+        for (var j = 0; j < els.length; j++) {
+          var el = els[j];
+          var style = window.getComputedStyle(el);
+          if (style.display !== 'none' && style.visibility !== 'hidden' && el.offsetParent !== null) return true;
+        }
+      }
+      return false;
+    })()
+  `)
+  if (!has2FA) return false
+
+  // 确认没有可见的密码框（避免误判密码页为 2FA 页）
+  const hasPwd = await exec(wc, `
+    (function() {
+      var sels = ${JSON.stringify(ENTERPRISE_PASSWORD_SELECTORS)};
+      for (var i = 0; i < sels.length; i++) {
+        var els = document.querySelectorAll(sels[i]);
+        for (var j = 0; j < els.length; j++) {
+          var el = els[j];
+          var style = window.getComputedStyle(el);
+          if (style.display !== 'none' && style.visibility !== 'hidden' && el.offsetParent !== null) return true;
+        }
+      }
+      return false;
+    })()
+  `)
+  if (hasPwd) return false
+
+  await delay(2000)
+  const code = generateTOTP(totpSecret)
+
+  await exec(wc, `
+    ${INJECT_SET_NATIVE_VALUE}
+    var sels = ${selectorList};
+    var input = null;
+    for (var i = 0; i < sels.length && !input; i++) {
+      var els = document.querySelectorAll(sels[i]);
+      for (var j = 0; j < els.length; j++) {
+        var el = els[j];
+        var s = window.getComputedStyle(el);
+        if (s.display !== 'none' && s.visibility !== 'hidden' && el.offsetParent !== null) { input = el; break; }
+      }
+    }
+    if (input) __setNativeValue(input, ${JSON.stringify(code)});
+  `)
+  await delay(500)
+  var submitSels = JSON.stringify(ENTERPRISE_SUBMIT_SELECTORS)
+  await exec(wc, `
+    var sels = ${submitSels};
+    var btn = null;
+    for (var i = 0; i < sels.length && !btn; i++) {
+      var els = document.querySelectorAll(sels[i]);
+      for (var j = 0; j < els.length; j++) {
+        var el = els[j];
+        var s = window.getComputedStyle(el);
+        if (s.display !== 'none' && s.visibility !== 'hidden' && el.offsetParent !== null) { btn = el; break; }
+      }
+    }
+    if (btn) btn.click();
+    else { var f = document.querySelector('form'); if (f) f.submit(); }
+  `)
+  return true
+}
+
+// ---------------------------------------------------------------------------
 // Main entry — startAutoFill
 // ---------------------------------------------------------------------------
 
@@ -316,8 +673,9 @@ async function googleFill2FA(wc: WebContents, totpSecret: string): Promise<boole
  */
 export function startAutoFill(
   webContents: WebContents,
-  provider: 'Github' | 'Google',
-  credentials: OAuthCredentials
+  provider: 'Github' | 'Google' | 'Enterprise',
+  credentials: OAuthCredentials,
+  onNewPassword?: (newPassword: string) => void
 ): void {
   let loginDone = false
   let twofaDone = false
@@ -363,7 +721,7 @@ export function startAutoFill(
             log('2FA filled on retry')
           }
         }
-      } else {
+      } else if (provider === 'Google') {
         // Google: email → password → 2FA (sequential steps across navigations)
         if (!loginDone) {
           const emailFilled = await withTimeout(googleFillEmail(webContents, credentials.username), STEP_TIMEOUT)
@@ -393,6 +751,90 @@ export function startAutoFill(
             log('2FA filled on retry')
           }
         }
+      } else {
+        // Enterprise: SPA 页面（如 AWS IAM Identity Center）需要轮询等待表单渲染
+        // 所有步骤在同一个调用中顺序完成，因为 SPA 内部跳转不触发 did-navigate
+        if (!loginDone) {
+          // Step 1: 用户名
+          const userFilled = await waitAndFill(webContents, destroyed, () => enterpriseFillUsername(webContents, credentials.username), 15000, 800)
+          if (userFilled) {
+            log('username filled')
+          } else {
+            log('username input not found, trying password directly')
+          }
+
+          // Step 2: 密码（等待页面跳转或同页渲染）
+          await delay(1500)
+          if (destroyed) return
+          const pwdFilled = await waitAndFill(webContents, destroyed, () => enterpriseFillPassword(webContents, credentials.password), 15000, 800)
+          if (pwdFilled) {
+            loginDone = true
+            log('password filled & submitted')
+          } else {
+            log('password input not found')
+            return
+          }
+        }
+
+        // Step 3: 检测"设置新密码"页面（密码提交后可能出现）
+        if (loginDone) {
+          await delay(1500)
+          if (destroyed) return
+          let capturedNewPassword: string | null = null
+          const newPwdHandled = await waitAndFill(webContents, destroyed, async () => {
+            const result = await enterpriseFillNewPassword(webContents)
+            if (result) {
+              capturedNewPassword = result
+              return true
+            }
+            return false
+          }, 10000, 800)
+          if (newPwdHandled && capturedNewPassword) {
+            log('new password set & submitted')
+            if (onNewPassword) onNewPassword(capturedNewPassword)
+            await delay(2000)
+            if (destroyed) return
+          }
+        }
+
+        // Step 4: 2FA（密码提交后继续等待 MFA 页面渲染）
+        if (loginDone && !twofaDone && credentials.totpSecret) {
+          await delay(1500)
+          if (destroyed) return
+          const filled = await waitAndFill(webContents, destroyed, () => enterpriseFill2FA(webContents, credentials.totpSecret!), 15000, 800)
+          if (filled) {
+            twofaDone = true
+            log('2FA filled & submitted')
+          } else {
+            log('2FA input not found')
+          }
+        }
+
+        // Step 5: 自动点击授权按钮（Allow access）
+        if (loginDone && (twofaDone || !credentials.totpSecret)) {
+          await delay(1500)
+          if (destroyed) return
+          const clicked = await waitAndFill(webContents, destroyed, async () => {
+            const found = await exec(webContents, `
+              (function() {
+                var sels = [
+                  'button[data-testid="allow-access-button"]',
+                  'button[data-analytics="consent-allow-access"]',
+                  'button.awsui_variant-primary_vjswe_1ni89_235',
+                ];
+                for (var i = 0; i < sels.length; i++) {
+                  var btn = document.querySelector(sels[i]);
+                  if (btn) { btn.click(); return true; }
+                }
+                return false;
+              })()
+            `)
+            return !!found
+          }, 10000, 800)
+          if (clicked) {
+            log('Allow access button clicked')
+          }
+        }
       }
     } catch (err) {
       log(`error: ${err}`)
@@ -416,6 +858,28 @@ export function startAutoFill(
 // ---------------------------------------------------------------------------
 // Timeout wrapper
 // ---------------------------------------------------------------------------
+
+/**
+ * 轮询等待 SPA 表单元素出现并执行填充。
+ * 每隔 interval ms 调用一次 fillFn，直到返回 true 或超时。
+ */
+async function waitAndFill(
+  _wc: WebContents,
+  destroyed: boolean,
+  fillFn: () => Promise<boolean>,
+  timeout: number,
+  interval: number
+): Promise<boolean> {
+  const deadline = Date.now() + timeout
+  while (Date.now() < deadline && !destroyed) {
+    try {
+      const filled = await fillFn()
+      if (filled) return true
+    } catch { /* ignore, retry */ }
+    await delay(interval)
+  }
+  return false
+}
 
 function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
   return Promise.race([

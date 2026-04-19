@@ -3665,12 +3665,15 @@ app.whenReady().then(async () => {
     region?: string
     expiresIn?: number
     error?: string
+    newPassword?: string
   } | null = null
+  let pendingNewPassword: string | null = null
 
   // IPC: 启动 IAM Identity Center SSO 登录 (使用 Authorization Code Grant with PKCE)
-  ipcMain.handle('start-iam-sso-login', async (_event, startUrl: string, region: string = 'us-east-1') => {
+  ipcMain.handle('start-iam-sso-login', async (_event, startUrl: string, region: string = 'us-east-1', credentials?: OAuthCredentials) => {
     console.log('[Login] Starting IAM Identity Center SSO login (Authorization Code flow)...')
     console.log('[Login] Start URL:', startUrl)
+    console.log('[Login] Auto-fill:', !!credentials)
     
     // 验证 startUrl 格式
     if (!startUrl || !startUrl.startsWith('https://')) {
@@ -3841,7 +3844,7 @@ app.whenReady().then(async () => {
         console.log('[Login] OAuth callback server listening on port', port)
       })
 
-      // Step 4: 构建授权 URL 并打开浏览器
+      // Step 4: 构建授权 URL 并在隔离窗口中打开
       const authorizeParams = new URLSearchParams({
         response_type: 'code',
         client_id: clientId,
@@ -3852,7 +3855,7 @@ app.whenReady().then(async () => {
         code_challenge_method: 'S256'
       })
       const authorizeUrl = `${oidcBase}/authorize?${authorizeParams.toString()}`
-      console.log('[Login] Opening browser for authorization...')
+      console.log('[Login] Opening isolated BrowserWindow for authorization...')
 
       // 保存登录状态
       currentLoginState = {
@@ -3866,7 +3869,64 @@ app.whenReady().then(async () => {
         expiresAt: Date.now() + 600000
       }
 
-      // 返回授权 URL，前端会打开浏览器
+      // 使用隔离 session 的 BrowserWindow（和 Social Login 一样，每次干净的 cookie 环境）
+      const partition = `oauth-iamsso-${Date.now()}`
+      const oauthSession = session.fromPartition(partition)
+      const oauthWin = new BrowserWindow({
+        width: 900,
+        height: 700,
+        title: `Enterprise SSO Login`,
+        webPreferences: {
+          partition,
+          nodeIntegration: false,
+          contextIsolation: true,
+        },
+      })
+      oauthWin.setMenuBarVisibility(false)
+
+      // 监听导航：当浏览器跳转到回调 URL 时，本地 HTTP server 会处理，窗口可以关闭
+      const callbackPrefix = `http://127.0.0.1:${port}/oauth/callback`
+      const checkAndCloseOnCallback = (url: string) => {
+        if (url.startsWith(callbackPrefix)) {
+          // 回调已被本地 HTTP server 处理，延迟关闭窗口让 server 完成 token 交换
+          setTimeout(() => {
+            if (!oauthWin.isDestroyed()) oauthWin.close()
+          }, 1500)
+        }
+      }
+      oauthWin.webContents.on('will-redirect', (_ev, url) => checkAndCloseOnCallback(url))
+      oauthWin.webContents.on('will-navigate', (_ev, url) => checkAndCloseOnCallback(url))
+      oauthWin.webContents.on('did-navigate', (_ev, url) => checkAndCloseOnCallback(url))
+
+      // 窗口关闭时清理 session
+      oauthWin.on('closed', () => {
+        oauthSession.clearStorageData().catch(() => {})
+      })
+
+      oauthWin.loadURL(authorizeUrl)
+
+      // 如果提供了凭据，启动自动填充
+      if (credentials) {
+        startAutoFill(oauthWin.webContents, 'Enterprise', credentials, async (newPassword: string) => {
+          console.log('[Login] New password was set during auto-login for:', credentials.username)
+          pendingNewPassword = newPassword
+          // 将新密码写入 socialCredentials store（保留初始密码不动）
+          try {
+            await initStore()
+            const list = (store!.get('socialCredentials', []) as Array<{ username: string; type: string; startUrl?: string; password: string; newPassword?: string }>)
+            const idx = list.findIndex(c => c.username === credentials.username && c.type === 'enterprise')
+            if (idx >= 0) {
+              list[idx].newPassword = newPassword
+              store!.set('socialCredentials', list)
+              console.log('[Login] Social credential newPassword saved in store (initial password preserved)')
+            }
+          } catch (e) {
+            console.error('[Login] Failed to update credential password:', e)
+          }
+        })
+      }
+
+      // 返回成功（不再返回 authorizeUrl，前端不需要 openExternal 了）
       return {
         success: true,
         authorizeUrl,
@@ -3898,6 +3958,11 @@ app.whenReady().then(async () => {
     if (iamSsoResult) {
       const result = { ...iamSsoResult }
       if (result.completed) {
+        // 附带新密码（如果在登录过程中设置了新密码）
+        if (pendingNewPassword) {
+          result.newPassword = pendingNewPassword
+          pendingNewPassword = null
+        }
         // 清理状态
         if (iamSsoServer) {
           iamSsoServer.close()
@@ -3921,6 +3986,7 @@ app.whenReady().then(async () => {
       iamSsoServer = null
     }
     iamSsoResult = null
+    pendingNewPassword = null
     currentLoginState = null
     return { success: true }
   })
